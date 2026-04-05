@@ -1,0 +1,43 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Node dependencies
+node_modules/
+
+# Next.js build
+.next/
+out/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Environment secrets
+.env
+.env.*
+.env.local
+
+# Uploads
+uploads/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
