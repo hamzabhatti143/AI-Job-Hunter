@@ -55,7 +55,10 @@ async def get_current_user(
     if cached:
         user, cached_at = cached
         if now - cached_at < _USER_CACHE_TTL:
-            return user
+            # Re-attach the cached (detached) instance to the current session.
+            # Without this, attributes accessed after the original session closed
+            # raise DetachedInstanceError.
+            return await db.merge(user)
         del _user_cache[token]   # expired
 
     user = (await db.execute(select(User).where(User.id == uuid.UUID(user_id)))).scalar_one_or_none()
