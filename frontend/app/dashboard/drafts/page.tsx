@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import api from '@/lib/api'
 
@@ -9,79 +9,113 @@ interface Draft {
 interface Content {
   subject?: string; body?: string; job_title?: string; company?: string; recipient?: string
 }
+interface DraftState {
+  subject: string
+  body: string
+  to: string
+  saving: boolean
+  sending: boolean
+  sent: boolean
+  deleting: boolean
+  error: string
+  resumeWarning: string
+  copied: '' | 'all' | 'body'
+}
+
 function parse(raw: string): Content {
   try { return JSON.parse(raw) } catch { return { body: raw } }
 }
 
 export default function DraftsPage() {
   const router = useRouter()
-  const [drafts, setDrafts] = useState<Draft[]>([])
-  const [loading, setLoading] = useState(true)
-  const [copied, setCopied] = useState<string | null>(null)
-  const [deleting, setDeleting] = useState<string | null>(null)
-  // Send email state
-  const [sendingId, setSendingId] = useState<string | null>(null)
-  const [sendEmail, setSendEmail] = useState<Record<string, string>>({})
-  const [sendResult, setSendResult] = useState<Record<string, { ok: boolean; msg: string }>>({})
-  const [sendLoading, setSendLoading] = useState<string | null>(null)
+  const [drafts, setDrafts]       = useState<Draft[]>([])
+  const [loading, setLoading]     = useState(true)
+  const [states, setStates]       = useState<Record<string, DraftState>>({})
 
-  useEffect(() => { fetchDrafts() }, [])
+  const setField = (id: string, patch: Partial<DraftState>) =>
+    setStates(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }))
 
-  const fetchDrafts = async () => {
+  const fetchDrafts = useCallback(async () => {
     try {
       const res = await api.get('/dashboard/pending')
-      setDrafts(res.data.filter((d: Draft) => d.status === 'pending'))
+      const pending: Draft[] = res.data.filter((d: Draft) => d.status === 'pending')
+      setDrafts(pending)
+      const map: Record<string, DraftState> = {}
+      for (const d of pending) {
+        const c = parse(d.draft_content)
+        map[d.id] = {
+          subject: c.subject || '',
+          body:    c.body    || '',
+          to:      c.recipient || '',
+          saving: false, sending: false, sent: false, deleting: false,
+          error: '', resumeWarning: '', copied: '',
+        }
+      }
+      setStates(map)
     } catch { router.push('/login') }
     finally { setLoading(false) }
-  }
+  }, [router])
 
-  const copyAll = async (draft: Draft) => {
-    const c = parse(draft.draft_content)
-    const text = `Subject: ${c.subject || ''}\n\n${c.body || ''}`
-    await navigator.clipboard.writeText(text)
-    setCopied(draft.id)
-    setTimeout(() => setCopied(null), 2500)
-  }
+  useEffect(() => { fetchDrafts() }, [fetchDrafts])
 
-  const copyBody = async (draft: Draft) => {
-    const c = parse(draft.draft_content)
-    await navigator.clipboard.writeText(c.body || '')
-    setCopied(draft.id + '_body')
-    setTimeout(() => setCopied(null), 2500)
-  }
-
-  const deleteDraft = async (draft: Draft) => {
-    setDeleting(draft.id)
+  const saveDraft = async (id: string) => {
+    const s = states[id]
+    if (!s) return
+    setField(id, { saving: true, error: '' })
     try {
-      await api.delete(`/pipeline/draft/${draft.id}`)
-      setDrafts(d => d.filter(x => x.id !== draft.id))
-    } catch { } finally { setDeleting(null) }
-  }
-
-  const toggleSendPanel = (id: string, prefillEmail?: string) => {
-    setSendingId(prev => prev === id ? null : id)
-    setSendResult(r => ({ ...r, [id]: { ok: false, msg: '' } }))
-    if (prefillEmail) {
-      setSendEmail(r => ({ ...r, [id]: r[id] || prefillEmail }))
+      const fd = new FormData()
+      fd.append('subject', s.subject)
+      fd.append('body',    s.body)
+      await api.put(`/pipeline/draft/${id}`, fd)
+    } catch (err: any) {
+      setField(id, { error: err.response?.data?.detail || 'Failed to save.' })
+    } finally {
+      setField(id, { saving: false })
     }
   }
 
-  const sendEmail_ = async (draft: Draft) => {
-    const recipient = (sendEmail[draft.id] || '').trim()
-    if (!recipient) return
-    setSendLoading(draft.id)
-    setSendResult(r => ({ ...r, [draft.id]: { ok: false, msg: '' } }))
+  const sendDraft = async (id: string) => {
+    const s = states[id]
+    if (!s || !s.to.trim()) return
+    setField(id, { sending: true, error: '', resumeWarning: '' })
     try {
-      const form = new FormData()
-      form.append('recipient_email', recipient)
-      await api.post(`/pipeline/send/${draft.id}`, form)
-      setSendResult(r => ({ ...r, [draft.id]: { ok: true, msg: `Sent to ${recipient}` } }))
-      // Remove from list after short delay
-      setTimeout(() => setDrafts(d => d.filter(x => x.id !== draft.id)), 1800)
+      // Save edits first
+      const putFd = new FormData()
+      putFd.append('subject', s.subject)
+      putFd.append('body',    s.body)
+      await api.put(`/pipeline/draft/${id}`, putFd)
+      // Send
+      const fd = new FormData()
+      fd.append('recipient_email', s.to.trim())
+      const res = await api.post(`/pipeline/send/${id}`, fd)
+      const resumeAttached: boolean = res.data?.resume_attached ?? true
+      setField(id, {
+        sending: false,
+        sent:    true,
+        resumeWarning: resumeAttached ? '' : 'Email sent but resume was not attached — re-upload your resume in the pipeline.',
+      })
+      setTimeout(() => setDrafts(prev => prev.filter(d => d.id !== id)), 2000)
     } catch (err: any) {
-      const msg = err.response?.data?.detail || 'Failed to send email'
-      setSendResult(r => ({ ...r, [draft.id]: { ok: false, msg } }))
-    } finally { setSendLoading(null) }
+      const msg = err.response?.data?.detail || 'Failed to send email.'
+      setField(id, { sending: false, error: msg })
+    }
+  }
+
+  const deleteDraft = async (id: string) => {
+    setField(id, { deleting: true })
+    try {
+      await api.delete(`/pipeline/draft/${id}`)
+      setDrafts(prev => prev.filter(d => d.id !== id))
+    } catch { setField(id, { deleting: false }) }
+  }
+
+  const copyText = async (id: string, type: 'all' | 'body') => {
+    const s = states[id]
+    if (!s) return
+    const text = type === 'all' ? `Subject: ${s.subject}\n\n${s.body}` : s.body
+    await navigator.clipboard.writeText(text).catch(() => {})
+    setField(id, { copied: type })
+    setTimeout(() => setField(id, { copied: '' }), 2000)
   }
 
   if (loading) return <div className="text-gray-400 py-12 text-center">Loading drafts…</div>
@@ -91,114 +125,138 @@ export default function DraftsPage() {
       <div>
         <h2 className="text-2xl font-bold text-white">Application Drafts</h2>
         <p className="text-gray-500 text-sm mt-1">
-          Copy the email content, or send it directly via your configured SMTP email account.
-          <a href="/dashboard/settings" className="text-blue-400 hover:underline ml-1">Set up email →</a>
+          Edit the subject and body, enter a recipient, then send directly or copy to paste elsewhere.{' '}
+          <a href="/dashboard/settings" className="text-blue-400 hover:underline">Set up email →</a>
         </p>
       </div>
 
       {drafts.length === 0 ? (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-12 text-center">
           <p className="text-gray-500 mb-2">No drafts yet.</p>
-          <p className="text-gray-600 text-sm">Run the pipeline from Overview, or click <strong className="text-gray-400">Apply</strong> on a matched job.</p>
+          <p className="text-gray-600 text-sm">Run the pipeline from Overview, or go to <strong className="text-gray-400">Matched Jobs</strong> to generate drafts.</p>
         </div>
       ) : (
         <div className="space-y-4">
           {drafts.map(draft => {
+            const s = states[draft.id]
             const c = parse(draft.draft_content)
-            const result = sendResult[draft.id]
+            if (!s) return null
             return (
               <div key={draft.id} className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+
                 {/* Header */}
                 <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
                   <div>
                     <p className="text-white font-semibold">
                       {c.job_title ? `${c.job_title} @ ${c.company}` : 'Application Email'}
                     </p>
-                    <p className="text-gray-500 text-xs mt-0.5">{new Date(draft.created_at).toLocaleString()}</p>
+                    <p className="text-gray-500 text-xs mt-0.5">
+                      {new Date(draft.created_at).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}
+                    </p>
                   </div>
                   <button
-                    onClick={() => deleteDraft(draft)}
-                    disabled={deleting === draft.id}
+                    onClick={() => deleteDraft(draft.id)}
+                    disabled={s.deleting}
                     className="text-xs text-gray-600 hover:text-red-400 transition px-2 py-1 rounded">
-                    {deleting === draft.id ? '…' : 'Dismiss'}
+                    {s.deleting ? '…' : 'Dismiss'}
                   </button>
                 </div>
 
-                {/* Content */}
-                <div className="px-6 py-4 space-y-3">
-                  <div className="flex items-start gap-3">
-                    <span className="text-gray-500 text-sm w-16 flex-shrink-0 pt-0.5">Subject</span>
-                    <span className="text-gray-200 text-sm font-medium flex-1">{c.subject}</span>
-                  </div>
-                  <div className="bg-gray-950 border border-gray-800 rounded-lg p-4 text-gray-300 text-sm whitespace-pre-wrap leading-relaxed">
-                    {c.body}
-                  </div>
-                </div>
-
-                {/* Actions */}
-                <div className="flex items-center gap-3 px-6 py-4 border-t border-gray-800 bg-gray-950 flex-wrap">
-                  <button
-                    onClick={() => copyAll(draft)}
-                    className="bg-blue-700 hover:bg-blue-600 text-white text-sm font-semibold px-4 py-2 rounded-lg transition">
-                    {copied === draft.id ? 'Copied!' : 'Copy Subject + Body'}
-                  </button>
-                  <button
-                    onClick={() => copyBody(draft)}
-                    className="bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium px-4 py-2 rounded-lg transition">
-                    {copied === draft.id + '_body' ? 'Copied!' : 'Copy Body Only'}
-                  </button>
-                  <button
-                    onClick={() => toggleSendPanel(draft.id, c.recipient)}
-                    className={`text-sm font-medium px-4 py-2 rounded-lg transition border ${
-                      sendingId === draft.id
-                        ? 'bg-emerald-900 border-emerald-700 text-emerald-300'
-                        : 'bg-gray-800 border-gray-700 text-gray-300 hover:text-white hover:border-emerald-600'
-                    }`}>
-                    Send via Email
-                  </button>
-                  <span className="text-gray-600 text-xs ml-auto hidden sm:block">
-                    Paste into Gmail, LinkedIn, or the company portal
-                  </span>
-                </div>
-
-                {/* Send panel */}
-                {sendingId === draft.id && (
-                  <div className="px-6 py-4 border-t border-gray-800 bg-gray-950 space-y-3">
-                    <p className="text-gray-400 text-sm">
-                      {c.recipient
-                        ? <>Recruiter email pre-filled — verify before sending:</>
-                        : <>Enter the recruiter&apos;s email address to send directly:</>}
-                    </p>
-                    <div className="flex gap-2">
-                      <input
-                        type="email"
-                        placeholder="recruiter@company.com"
-                        value={sendEmail[draft.id] || ''}
-                        onChange={e => setSendEmail(r => ({ ...r, [draft.id]: e.target.value }))}
-                        onKeyDown={e => { if (e.key === 'Enter') sendEmail_(draft) }}
-                        className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 focus:outline-none focus:border-emerald-500"
-                      />
-                      <button
-                        onClick={() => sendEmail_(draft)}
-                        disabled={sendLoading === draft.id || !sendEmail[draft.id]?.trim()}
-                        className="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white text-sm font-semibold px-4 py-2 rounded-lg transition">
-                        {sendLoading === draft.id ? 'Sending…' : 'Send'}
-                      </button>
-                    </div>
-                    {result?.msg && (
-                      <p className={`text-sm ${result.ok ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {result.msg}
-                        {!result.ok && result.msg.includes('SMTP not configured') && (
-                          <a href="/dashboard/settings" className="underline ml-1">Go to Settings</a>
-                        )}
-                      </p>
+                {/* Sent confirmation */}
+                {s.sent ? (
+                  <div className="px-6 py-5 space-y-1">
+                    <p className="text-emerald-400 text-sm font-medium">✅ Email sent successfully.</p>
+                    {s.resumeWarning && (
+                      <p className="text-yellow-400 text-xs">{s.resumeWarning}</p>
                     )}
-                    <p className="text-gray-600 text-xs">
-                      Requires Gmail (or other SMTP) credentials configured in{' '}
-                      <a href="/dashboard/settings" className="text-blue-400 hover:underline">Settings</a>.
-                      For Gmail, use an App Password — not your regular password.
-                    </p>
                   </div>
+                ) : (
+                  <>
+                    {/* Editable fields */}
+                    <div className="px-6 py-4 space-y-3">
+
+                      {/* To */}
+                      <div>
+                        <label className="text-gray-500 text-xs font-medium block mb-1">To</label>
+                        <input
+                          value={s.to}
+                          onChange={e => setField(draft.id, { to: e.target.value })}
+                          placeholder="recruiter@company.com"
+                          disabled={s.sending}
+                          className="w-full bg-gray-950 border border-gray-700 focus:border-blue-500 text-white text-sm px-3 py-2 rounded-lg outline-none transition disabled:opacity-50"
+                        />
+                        {!s.to.trim() && (
+                          <p className="text-gray-600 text-xs mt-1">Enter recipient email to send.</p>
+                        )}
+                      </div>
+
+                      {/* Subject */}
+                      <div>
+                        <label className="text-gray-500 text-xs font-medium block mb-1">Subject</label>
+                        <input
+                          value={s.subject}
+                          onChange={e => setField(draft.id, { subject: e.target.value })}
+                          disabled={s.sending}
+                          className="w-full bg-gray-950 border border-gray-700 focus:border-blue-500 text-white text-sm px-3 py-2 rounded-lg outline-none transition disabled:opacity-50"
+                        />
+                      </div>
+
+                      {/* Body */}
+                      <div>
+                        <label className="text-gray-500 text-xs font-medium block mb-1">Body</label>
+                        <textarea
+                          value={s.body}
+                          onChange={e => setField(draft.id, { body: e.target.value })}
+                          rows={12}
+                          disabled={s.sending}
+                          className="w-full bg-gray-950 border border-gray-700 focus:border-blue-500 text-white text-sm px-3 py-2 rounded-lg outline-none transition font-mono text-xs leading-relaxed resize-none disabled:opacity-50"
+                        />
+                      </div>
+
+                      {s.error && (
+                        <p className="text-red-400 text-sm">
+                          {s.error}
+                          {s.error.includes('SMTP') && (
+                            <a href="/dashboard/settings" className="underline ml-1">Go to Settings</a>
+                          )}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-2 px-6 py-4 border-t border-gray-800 bg-gray-950 flex-wrap">
+                      <button
+                        onClick={() => copyText(draft.id, 'all')}
+                        className="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-2 rounded-lg transition">
+                        {s.copied === 'all' ? '✓ Copied!' : 'Copy Subject + Body'}
+                      </button>
+                      <button
+                        onClick={() => copyText(draft.id, 'body')}
+                        className="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-2 rounded-lg transition">
+                        {s.copied === 'body' ? '✓ Copied!' : 'Copy Body'}
+                      </button>
+                      <button
+                        onClick={() => saveDraft(draft.id)}
+                        disabled={s.saving || s.sending}
+                        className="text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 px-3 py-2 rounded-lg transition disabled:opacity-40">
+                        {s.saving ? 'Saving…' : 'Save'}
+                      </button>
+                      <div className="flex-1" />
+                      {s.sending ? (
+                        <div className="flex items-center gap-2 text-gray-400 text-sm">
+                          <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                          Sending…
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => sendDraft(draft.id)}
+                          disabled={!s.to.trim() || !s.subject.trim() || s.saving}
+                          className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold px-5 py-2 rounded-lg transition">
+                          Send ✉
+                        </button>
+                      )}
+                    </div>
+                  </>
                 )}
               </div>
             )

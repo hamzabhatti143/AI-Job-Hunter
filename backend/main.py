@@ -143,6 +143,42 @@ async def lifespan(app: FastAPI):
         import asyncio as _asyncio
         _asyncio.create_task(_keepalive())
         print("[OK] DB keep-alive started (240s interval)")
+
+        # Fix existing resume_path values — scan RESUME_DIR and correct any stale/missing paths
+        try:
+            import os as _os
+            from sqlalchemy import select as _select, update as _update
+            from db.models import User as _User
+            from api.routes.pipeline import RESUME_DIR as _RESUME_DIR
+
+            # Build a map: user_id_prefix → absolute file path
+            resume_map: dict[str, str] = {}
+            if _os.path.isdir(_RESUME_DIR):
+                for fname in _os.listdir(_RESUME_DIR):
+                    # filenames are "{user_id}_resume.{ext}"
+                    parts = fname.split("_resume.", 1)
+                    if len(parts) == 2:
+                        resume_map[parts[0]] = _os.path.join(_RESUME_DIR, fname)
+
+            if resume_map:
+                async with AsyncSessionLocal() as session:
+                    users = (await session.execute(_select(_User))).scalars().all()
+                    fixed = 0
+                    for u in users:
+                        uid = str(u.id)
+                        correct_path = resume_map.get(uid)
+                        if correct_path and u.resume_path != correct_path:
+                            u.resume_path = correct_path
+                            session.add(u)
+                            fixed += 1
+                    if fixed:
+                        await session.commit()
+                        print(f"[OK] Fixed resume_path for {fixed} user(s)")
+                    else:
+                        print("[OK] All resume_path values are up to date")
+        except Exception as e:
+            print(f"[WARN] resume_path fix skipped: {e}")
+
     except Exception as e:
         print(f"[WARN] Startup error: {e}")
     yield

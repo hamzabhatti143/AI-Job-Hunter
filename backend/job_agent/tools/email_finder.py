@@ -155,8 +155,11 @@ def _get_search_domain(url: str, company: str) -> str:
 
 async def _mx_exists(domain: str) -> bool:
     try:
-        loop = asyncio.get_event_loop()
-        answers = await loop.run_in_executor(None, dns.resolver.resolve, domain, "MX")
+        loop = asyncio.get_running_loop()
+        answers = await asyncio.wait_for(
+            loop.run_in_executor(None, dns.resolver.resolve, domain, "MX"),
+            timeout=3.0,
+        )
         return len(answers) > 0
     except Exception:
         return False
@@ -218,7 +221,7 @@ async def _scrape_emails(client: httpx.AsyncClient, url: str) -> list[str]:
     - HTML entities like &#64; for @
     """
     try:
-        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
         if resp.status_code != 200:
             return []
         html = resp.text
@@ -262,7 +265,7 @@ async def _hunter_search(client: httpx.AsyncClient, domain: str) -> list[str]:
         resp = await client.get(
             "https://api.hunter.io/v2/domain-search",
             params={"domain": domain, "api_key": key, "limit": 5},
-            timeout=8,
+            timeout=4,
         )
         if resp.status_code != 200:
             return []
@@ -295,7 +298,7 @@ async def _serpapi_email_search(
             resp = await client.get(
                 "https://serpapi.com/search.json",
                 params={"engine": "google", "q": q, "api_key": key, "num": 5},
-                timeout=10,
+                timeout=5,
             )
             if resp.status_code != 200:
                 continue
@@ -374,15 +377,15 @@ async def _find_email_for_job(job: dict) -> dict:
         if url and not any(agg in _extract_domain_from_url(url) for agg in AGGREGATOR_DOMAINS):
             await _pick(await _scrape_emails(client, url), "listing")
 
-        # Attempt 2 — company careers / jobs pages (extended path list)
+        # Attempt 2 — company careers / jobs pages (top 3 paths only for speed)
         if not found_email and domain:
-            for path in _CAREER_PATHS:
+            for path in _CAREER_PATHS[:3]:
                 if await _pick(await _scrape_emails(client, f"https://{domain}{path}"), "careers"):
                     break
 
-        # Attempt 3 — contact / about / HR pages (extended path list)
+        # Attempt 3 — contact / about pages (top 3 paths only for speed)
         if not found_email and domain:
-            for path in _CONTACT_PATHS:
+            for path in _CONTACT_PATHS[:3]:
                 if await _pick(await _scrape_emails(client, f"https://{domain}{path}"), "contact"):
                     break
 

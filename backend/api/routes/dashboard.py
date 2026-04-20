@@ -4,6 +4,7 @@ from sqlalchemy import select, delete
 from db.database import get_db
 from db.models import User, JobMatch, ExtractedEmail, PendingEmail, SentEmail, ActivityLog, UserPreference
 from api.routes.auth import get_current_user
+from job_agent.tools.email_writer import clean_job_fields_sync
 import json
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -30,10 +31,34 @@ async def get_summary(current_user: User = Depends(get_current_user), db: AsyncS
 
 @router.get("/jobs")
 async def get_jobs(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    jobs = (await db.execute(select(JobMatch).where(JobMatch.user_id == current_user.id).order_by(JobMatch.created_at.desc()))).scalars().all()
-    return [
-        {
-            "id": str(j.id), "job_title": j.job_title, "company": j.company,
+    jobs = (await db.execute(
+        select(JobMatch).where(JobMatch.user_id == current_user.id).order_by(JobMatch.created_at.desc())
+    )).scalars().all()
+
+    # Fetch all pending drafts in one query and map by job_id
+    drafts = (await db.execute(
+        select(PendingEmail).where(
+            PendingEmail.user_id == current_user.id,
+            PendingEmail.status == "pending",
+        )
+    )).scalars().all()
+    draft_map: dict[str, PendingEmail] = {}
+    for d in drafts:
+        if d.job_id and str(d.job_id) not in draft_map:
+            draft_map[str(d.job_id)] = d
+
+    result = []
+    for j in jobs:
+        title, company = clean_job_fields_sync(j.job_title or "", j.company or "", j.job_url or "")
+        draft = draft_map.get(str(j.id))
+        draft_content: dict = {}
+        if draft:
+            try:
+                draft_content = json.loads(draft.draft_content or "{}")
+            except Exception:
+                pass
+        result.append({
+            "id": str(j.id), "job_title": title, "company": company,
             "match_score": float(j.match_score or 0),
             "match_tier": j.match_tier or "Good Match",
             "location": j.location, "job_url": j.job_url,
@@ -41,9 +66,11 @@ async def get_jobs(current_user: User = Depends(get_current_user), db: AsyncSess
             "status": j.status, "created_at": j.created_at.isoformat(),
             "matched_skills": j.matched_skills or [],
             "missing_skills": j.missing_skills or [],
-        }
-        for j in jobs
-    ]
+            "draft_id":      str(draft.id) if draft else None,
+            "email_subject": draft_content.get("subject") or None,
+            "email_body":    draft_content.get("body")    or None,
+        })
+    return result
 
 @router.get("/pending")
 async def get_pending(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -217,9 +244,10 @@ async def score_resume(
         parsed = json.loads(await resume_parser_impl(resume_path=current_user.resume_path))
         resume_text = parsed.get("resume_text", "")
 
+    clean_title, clean_company = clean_job_fields_sync(job.job_title or "", job.company or "", job.job_url or "")
     job_json = json.dumps({
-        "title": job.job_title,
-        "company": job.company,
+        "title": clean_title,
+        "company": clean_company,
         "description": "",
     })
     result = json.loads(await resume_scorer_impl(resume_text=resume_text, job_json=job_json))

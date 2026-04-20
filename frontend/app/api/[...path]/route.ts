@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 export const maxDuration = 300 // 5 minutes — pipeline can take a while
 
-const BACKEND = process.env.BACKEND_URL || 'https://hamzabhatti-job-hunter.hf.space'
+const BACKEND = process.env.BACKEND_URL || 'http://localhost:8000'
 
 async function handler(
   req: NextRequest,
@@ -24,22 +24,31 @@ async function handler(
       ? await req.arrayBuffer()
       : undefined
 
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 115000)
+
   try {
     const res = await fetch(url, {
       method: req.method,
-      headers: forwardHeaders,
+      headers: { ...forwardHeaders, 'Connection': 'keep-alive', 'Keep-Alive': 'timeout=120' },
       body: body !== undefined ? Buffer.from(body) : undefined,
+      signal: controller.signal,
     })
+    clearTimeout(timeoutId)
 
     const resBody = await res.arrayBuffer()
     const resContentType = res.headers.get('content-type') || 'application/json'
 
     return new NextResponse(resBody, {
       status: res.status,
-      headers: { 'content-type': resContentType },
+      headers: { 'content-type': resContentType, 'Connection': 'keep-alive' },
     })
-  } catch {
-    return NextResponse.json({ detail: 'Backend unreachable' }, { status: 502 })
+  } catch (err: any) {
+    clearTimeout(timeoutId)
+    if (err.name === 'AbortError') {
+      return NextResponse.json({ detail: 'This is taking longer than expected. Check your dashboard for updates.' }, { status: 504 })
+    }
+    return NextResponse.json({ detail: 'Could not reach server. Please check your connection and retry.' }, { status: 502 })
   }
 }
 
