@@ -30,7 +30,7 @@ async function handler(
   try {
     const res = await fetch(url, {
       method: req.method,
-      headers: { ...forwardHeaders, 'Connection': 'keep-alive', 'Keep-Alive': 'timeout=120' },
+      headers: forwardHeaders,
       body: body !== undefined ? Buffer.from(body) : undefined,
       signal: controller.signal,
     })
@@ -41,7 +41,7 @@ async function handler(
 
     return new NextResponse(resBody, {
       status: res.status,
-      headers: { 'content-type': resContentType, 'Connection': 'keep-alive' },
+      headers: { 'content-type': resContentType },
     })
   } catch (err: any) {
     clearTimeout(timeoutId)
