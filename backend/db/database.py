@@ -17,7 +17,16 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    connect_args={"ssl": ssl_context} if DATABASE_URL else {},
+    pool_size=5,
+    max_overflow=10,
+    pool_recycle=300,      # recycle connections every 5 min — prevents Neon cold starts
+    pool_timeout=30,
+    connect_args={
+        **({"ssl": ssl_context} if DATABASE_URL else {}),
+        "statement_cache_size": 0,        # required for Neon pgBouncer — avoids prepared-statement errors/retries
+        "prepared_statement_cache_size": 0,
+        "server_settings": {"application_name": "applyai"},
+    },
 )
 
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

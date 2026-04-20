@@ -7,7 +7,9 @@ import PublicHeader from '@/components/PublicHeader'
 
 export default function Signup() {
   const router = useRouter()
-  const [form, setForm] = useState({ name: '', username: '', email: '', password: '', confirmPassword: '' })
+  const [form, setForm] = useState({ name: '', username: '', email: '', password: '', confirmPassword: '', smtp_host: 'smtp.gmail.com', smtp_port: '587', smtp_user: '', smtp_password: '' })
+  const [showSmtp, setShowSmtp] = useState(false)
+  const [showSmtpPass, setShowSmtpPass] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const set = (f: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -21,6 +23,10 @@ export default function Signup() {
     try {
       const res = await api.post('/auth/signup', {
         name: form.name, username: form.username, email: form.email, password: form.password,
+        smtp_host: form.smtp_host || '',
+        smtp_port: parseInt(form.smtp_port) || 587,
+        smtp_user: form.smtp_user || '',
+        smtp_password: form.smtp_password || '',
       })
       localStorage.setItem('token', res.data.access_token)
       localStorage.setItem('user_name', res.data.name || '')
@@ -71,6 +77,65 @@ export default function Signup() {
                   <input type="password" required value={form.confirmPassword} onChange={set('confirmPassword')} placeholder="Repeat password" className={inp} />
                 </div>
               </div>
+            </section>
+
+            {/* Optional SMTP section */}
+            <section className="bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setShowSmtp(v => !v)}
+                className="w-full flex items-center justify-between px-5 py-4 text-left">
+                <div>
+                  <span className="text-sm font-semibold text-gray-300">Email Sending Setup</span>
+                  <span className="ml-2 text-xs text-gray-500">(Optional — you can also set this later in Settings)</span>
+                </div>
+                <span className="text-gray-500 text-xs">{showSmtp ? '▲ Hide' : '▼ Show'}</span>
+              </button>
+
+              {showSmtp && (
+                <div className="px-5 pb-5 space-y-4 border-t border-gray-800">
+                  <p className="text-xs text-gray-500 pt-3">
+                    Add your Gmail App Password to send application emails directly from the Drafts page.
+                    Gmail: Google Account → Security → App passwords.
+                  </p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1">SMTP Host</label>
+                      <input type="text" value={form.smtp_host}
+                        onChange={e => setForm(p => ({ ...p, smtp_host: e.target.value }))}
+                        placeholder="smtp.gmail.com" className={inp} />
+                    </div>
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1">Port</label>
+                      <input type="number" value={form.smtp_port}
+                        onChange={e => setForm(p => ({ ...p, smtp_port: e.target.value }))}
+                        placeholder="587" className={inp} />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-400 mb-1">Your Email (sender)</label>
+                    <input type="email" value={form.smtp_user}
+                      onChange={e => setForm(p => ({ ...p, smtp_user: e.target.value }))}
+                      placeholder="you@gmail.com" className={inp} />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-400 mb-1">App Password</label>
+                    <div className="relative">
+                      <input
+                        type={showSmtpPass ? 'text' : 'password'}
+                        value={form.smtp_password}
+                        onChange={e => setForm(p => ({ ...p, smtp_password: e.target.value }))}
+                        placeholder="xxxx xxxx xxxx xxxx"
+                        className={inp + ' pr-16'}
+                      />
+                      <button type="button" onClick={() => setShowSmtpPass(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">
+                        {showSmtpPass ? 'Hide' : 'Show'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </section>
 
             {error && (

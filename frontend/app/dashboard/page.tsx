@@ -15,7 +15,7 @@ export default function DashboardPage() {
   const router = useRouter()
   const [summary, setSummary] = useState<Summary | null>(null)
   const [plan, setPlan] = useState<'free' | 'paid'>('free')
-  const [form, setForm] = useState({ location: '', role_preference: '', resume: null as File | null, api_key: '' })
+  const [form, setForm] = useState({ location: '', role_preference: '', resume: null as File | null, api_key: '', recruiter_email: '' })
   const [running, setRunning] = useState(false)
   const [msg, setMsg] = useState('')
   const [error, setError] = useState('')
@@ -56,20 +56,44 @@ export default function DashboardPage() {
     fd.append('location', form.location)
     fd.append('role_preference', form.role_preference)
     fd.append('api_key', plan === 'free' ? '' : form.api_key)
+    fd.append('recruiter_email', form.recruiter_email)
 
     try {
-      const res = await api.post('/pipeline/start', fd)
-      const d = res.data
-      let info = d.output || 'Pipeline complete!'
-      if (d.detected_role) info += ` (Role: ${d.detected_role})`
-      if (d.detected_location) info += ` | Location: ${d.detected_location}`
-      setMsg(info)
-      fetchSummary()
+      // Start pipeline as background task — returns task_id immediately
+      const startRes = await api.post('/pipeline/start', fd)
+      const { task_id } = startRes.data
+
+      // Poll for status every 4 seconds
+      const poll = async (): Promise<void> => {
+        try {
+          const statusRes = await api.get(`/pipeline/status/${task_id}`)
+          const { status, result } = statusRes.data
+          if (status === 'running') {
+            setTimeout(poll, 4000)
+            return
+          }
+          if (status === 'done') {
+            const d = result || {}
+            let info = d.output || 'Pipeline complete!'
+            if (d.detected_role) info += ` · Role detected: ${d.detected_role}`
+            if (d.google_jobs_tip) info += ` · ${d.google_jobs_tip}`
+            setMsg(info)
+            fetchSummary()
+          } else {
+            setError(result?.error || 'Pipeline failed — check backend logs.')
+          }
+        } catch {
+          setError('Lost connection to server. Check that the backend is running.')
+        }
+        setRunning(false)
+      }
+      setTimeout(poll, 4000)
     } catch (err: any) {
       const detail = err.response?.data?.detail
       setError(Array.isArray(detail) ? detail.map((d: any) => d.msg).join(', ') :
-        typeof detail === 'string' ? detail : 'Pipeline failed')
-    } finally { setRunning(false) }
+        typeof detail === 'string' ? detail : 'Pipeline failed — could not start.')
+      setRunning(false)
+    }
   }
 
   const statCards = summary ? [
@@ -139,8 +163,8 @@ export default function DashboardPage() {
             <div>
               <label className="block text-sm text-gray-400 mb-1">Location</label>
               <input value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))}
-                required placeholder="Lahore, Pakistan · Remote…"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500" />
+                required placeholder="Enter city, country, or 'Remote'"
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500" />
             </div>
             <div>
               <label className="block text-sm text-gray-400 mb-1">Role</label>
@@ -154,6 +178,19 @@ export default function DashboardPage() {
             <input type="file" accept=".pdf,.docx,.doc"
               onChange={e => setForm(f => ({ ...f, resume: e.target.files?.[0] || null }))}
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-gray-300 file:mr-3 file:py-1 file:px-3 file:rounded file:border-0 file:bg-blue-600 file:text-white file:text-sm file:cursor-pointer" />
+          </div>
+
+          {/* Recruiter email — optional manual override */}
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Recruiter Email <span className="text-gray-600">(optional — skip if unknown)</span></label>
+            <input
+              type="email"
+              value={form.recruiter_email}
+              onChange={e => setForm(f => ({ ...f, recruiter_email: e.target.value }))}
+              placeholder="recruiter@company.com"
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+            />
+            <p className="text-gray-600 text-xs mt-1">If left blank, we automatically search for the recruiter&apos;s email across 6 sources.</p>
           </div>
 
           {/* Key input — only shown for paid plan */}
@@ -184,12 +221,12 @@ export default function DashboardPage() {
 
           {running && (
             <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 space-y-3">
-              <p className="text-gray-300 text-sm font-medium">Pipeline running — this takes about 20–30 seconds</p>
+              <p className="text-gray-300 text-sm font-medium">Pipeline running — this takes 1–2 minutes while we scan job boards</p>
               <div className="space-y-2">
                 {[
                   'Parsing resume…',
                   'Extracting skills, role & location…',
-                  'Searching jobs from 6 sources…',
+                  'Searching jobs across 9+ sources (Google Jobs, LinkedIn, Rozee.pk…)…',
                   'Scoring & matching jobs…',
                   'Drafting application emails…',
                 ].map((step, i) => (

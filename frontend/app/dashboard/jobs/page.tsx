@@ -5,16 +5,108 @@ import api from '@/lib/api'
 
 interface Job {
   id: string; job_title: string; company: string; match_score: number
-  location: string; job_url: string; status: string; created_at: string
+  match_tier: string; location: string; job_url: string; source: string
+  portal_type: string; status: string; created_at: string
+  matched_skills: string[]; missing_skills: string[]
+}
+
+// ── Recruiter Finder — always expanded, shown on every job ────────────────────
+function RecruiterFinder({ company, jobUrl }: { company: string; jobUrl: string }) {
+  const [copied, setCopied] = useState('')
+
+  const safeCompany = company || 'this company'
+  const domainBase = safeCompany.toLowerCase()
+    .replace(/\s+(inc|llc|ltd|pvt|limited|technologies|solutions|group)\.?$/i, '')
+    .replace(/[^a-z0-9]/g, '')
+  const domain = (domainBase.slice(0, 22) || 'company') + '.com'
+
+  const emailPatterns = [
+    `hr@${domain}`, `jobs@${domain}`, `careers@${domain}`, `recruit@${domain}`,
+  ]
+
+  const copy = (text: string) => {
+    navigator.clipboard.writeText(text)
+    setCopied(text)
+    setTimeout(() => setCopied(''), 2000)
+  }
+
+  const companyQ        = encodeURIComponent(safeCompany)
+  const googleHR        = `https://www.google.com/search?q=%22${companyQ}%22+recruiter+OR+%22HR+manager%22+email+site%3Alinkedin.com`
+  const googleEmail     = `https://www.google.com/search?q=%22${companyQ}%22+%22@${domain}%22+recruiter+OR+HR`
+  const linkedinPeople  = `https://www.linkedin.com/search/results/people/?keywords=${companyQ}+HR+recruiter&origin=GLOBAL_SEARCH_HEADER`
+  const linkedinCompany = `https://www.linkedin.com/company/${safeCompany.toLowerCase().replace(/[^a-z0-9]/g, '-')}/people/`
+
+  return (
+    <div className="mt-3 border-t border-gray-800 pt-3 space-y-3">
+
+      {/* Search links */}
+      <div>
+        <p className="text-gray-500 text-xs mb-1.5 font-medium">Find recruiter — opens in a new tab:</p>
+        <div className="flex flex-wrap gap-2">
+          <a href={googleHR} target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-xs bg-blue-950 border border-blue-800 text-blue-300 hover:bg-blue-900 px-2.5 py-1 rounded-lg transition">
+            Google: LinkedIn HR profiles ↗
+          </a>
+          <a href={googleEmail} target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-xs bg-blue-950 border border-blue-800 text-blue-300 hover:bg-blue-900 px-2.5 py-1 rounded-lg transition">
+            Google: company email ↗
+          </a>
+          <a href={linkedinPeople} target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-xs bg-blue-950 border border-blue-800 text-blue-300 hover:bg-blue-900 px-2.5 py-1 rounded-lg transition">
+            LinkedIn: HR people ↗
+          </a>
+          <a href={linkedinCompany} target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-xs bg-blue-950 border border-blue-800 text-blue-300 hover:bg-blue-900 px-2.5 py-1 rounded-lg transition">
+            LinkedIn: company people ↗
+          </a>
+          {jobUrl && (
+            <a href={jobUrl} target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs bg-gray-800 border border-gray-700 text-gray-300 hover:bg-gray-700 px-2.5 py-1 rounded-lg transition">
+              Job listing ↗
+            </a>
+          )}
+        </div>
+      </div>
+
+      {/* Email pattern guesses — click to copy */}
+      <div>
+        <p className="text-gray-500 text-xs mb-1.5 font-medium">
+          Common email patterns — click to copy:
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {emailPatterns.map(e => (
+            <button key={e} onClick={() => copy(e)} title="Click to copy"
+              className={`text-xs px-2.5 py-1 rounded font-mono border transition ${
+                copied === e
+                  ? 'bg-emerald-900 border-emerald-700 text-emerald-300'
+                  : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-500'
+              }`}>
+              {copied === e ? '✓ Copied' : e}
+            </button>
+          ))}
+        </div>
+        <p className="text-gray-600 text-xs mt-1.5">
+          Tip: open the job listing → check the Contact or About page for the real email.
+        </p>
+      </div>
+
+    </div>
+  )
+}
+
+const SOURCE_LABELS: Record<string, string> = {
+  remoteok: 'RemoteOK', remotive: 'Remotive', weworkremotely: 'We Work Remotely',
+  arbeitnow: 'Arbeitnow', findwork: 'Findwork', jobicy: 'Jobicy',
+  themuse: 'The Muse', serpapi_google_jobs: 'Google Jobs', adzuna: 'Adzuna',
+  smartrecruiters: 'Brightspyre', bayt: 'Bayt.com', rozee: 'Rozee.pk',
+  acca_global: 'ACCA Global', trabajo_pk: 'Trabajo.org (PK)', bebee: 'Bebee',
+  joinimagine: 'Join Imagine', interviewpal: 'InterviewPal',
 }
 
 export default function JobsPage() {
   const router = useRouter()
   const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
-  const [applying, setApplying] = useState<string | null>(null)
-  const [msg, setMsg] = useState<{ id: string; text: string; type: 'ok' | 'err' } | null>(null)
-  const [apiKeyPrompt, setApiKeyPrompt] = useState<{ jobId: string; key: string } | null>(null)
   const [clearing, setClearing] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [clearError, setClearError] = useState('')
@@ -27,39 +119,6 @@ export default function JobsPage() {
       setJobs(res.data)
     } catch { router.push('/login') }
     finally { setLoading(false) }
-  }
-
-  const applyJob = async (job: Job, overrideKey?: string) => {
-    const apiKey = overrideKey || localStorage.getItem('api_key') || ''
-    if (!apiKey) {
-      setApiKeyPrompt({ jobId: job.id, key: '' })
-      return
-    }
-    // Save key for future use
-    localStorage.setItem('api_key', apiKey)
-    setApiKeyPrompt(null)
-    setApplying(job.id)
-    setMsg(null)
-    const fd = new FormData()
-    fd.append('api_key', apiKey)
-    try {
-      await api.post(`/pipeline/apply-job/${job.id}`, fd)
-      setMsg({ id: job.id, text: `Email drafted for ${job.job_title}! Check Pending Emails to approve and send.`, type: 'ok' })
-      fetchJobs()
-    } catch (err: any) {
-      const detail = err.response?.data?.detail
-      let errorText = 'Failed to apply — please try again.'
-      if (typeof detail === 'string') {
-        errorText = detail
-      } else if (Array.isArray(detail)) {
-        errorText = detail.map((d: any) => d.msg || d.message || JSON.stringify(d)).join('; ')
-      } else if (detail) {
-        errorText = JSON.stringify(detail)
-      }
-      setMsg({ id: job.id, text: errorText, type: 'err' })
-    } finally {
-      setApplying(null)
-    }
   }
 
   const clearJobs = async () => {
@@ -83,7 +142,10 @@ export default function JobsPage() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold text-white">Matched Jobs</h2>
-          <p className="text-gray-500 text-sm mt-1">Jobs matched from your last pipeline run, sorted by relevance score.</p>
+          <p className="text-gray-500 text-sm mt-1">
+            Jobs matched from your last pipeline run, sorted by relevance score. Find the recruiter email and send your draft from{' '}
+            <a href="/dashboard/drafts" className="text-blue-400 hover:underline">Application Drafts</a>.
+          </p>
         </div>
         {jobs.length > 0 && (
           <div className="flex items-center gap-2 flex-shrink-0">
@@ -123,88 +185,90 @@ export default function JobsPage() {
           {jobs.map(job => (
             <div key={job.id} className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4">
               <div className="flex items-start justify-between gap-4">
+
                 {/* Job info */}
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-3 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-white font-semibold">{job.job_title}</span>
+                    {job.match_tier === 'Top Match' ? (
+                      <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-emerald-900 text-emerald-300 border border-emerald-700">
+                        Top Match
+                      </span>
+                    ) : (
+                      <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-blue-900 text-blue-300">
+                        Good Match
+                      </span>
+                    )}
                     <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium ${
                       job.status === 'applied' ? 'bg-green-900 text-green-300' :
                       job.status === 'rejected' ? 'bg-red-900 text-red-300' :
-                      'bg-blue-900 text-blue-300'
+                      'bg-gray-800 text-gray-400'
                     }`}>{job.status}</span>
                   </div>
                   <div className="text-gray-400 text-sm mt-1">{job.company} · {job.location}</div>
-                  <div className="text-gray-500 text-xs mt-1">
-                    Matched on: <span className="text-gray-400">{new Date(job.created_at).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}</span>
+
+                  {/* Skill match / gap */}
+                  {(job.matched_skills?.length > 0 || job.missing_skills?.length > 0) && (
+                    <div className="mt-2 space-y-1">
+                      {job.matched_skills?.length > 0 && (
+                        <div className="flex flex-wrap gap-1 items-center">
+                          <span className="text-gray-600 text-xs shrink-0">Matched:</span>
+                          {job.matched_skills.map(s => (
+                            <span key={s} className="text-xs bg-emerald-950 text-emerald-400 border border-emerald-800 px-1.5 py-0.5 rounded">
+                              {s}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {job.missing_skills?.length > 0 && (
+                        <div className="flex flex-wrap gap-1 items-center">
+                          <span className="text-gray-600 text-xs shrink-0">Gaps:</span>
+                          {job.missing_skills.map(s => (
+                            <span key={s} className="text-xs bg-gray-800 text-gray-500 border border-gray-700 px-1.5 py-0.5 rounded">
+                              {s}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-3 mt-1 flex-wrap">
+                    <span className="text-gray-500 text-xs">
+                      Matched: <span className="text-gray-400">{new Date(job.created_at).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}</span>
+                    </span>
+                    {job.source && (
+                      <span className="text-xs bg-gray-800 text-gray-500 px-2 py-0.5 rounded">
+                        {SOURCE_LABELS[job.source] || job.source}
+                      </span>
+                    )}
+                    {job.portal_type && job.portal_type !== 'Unknown' && (
+                      <span className="text-xs text-gray-500">
+                        via <span className="text-gray-400">{job.portal_type}</span>
+                      </span>
+                    )}
                   </div>
                 </div>
 
-                {/* Score + actions */}
+                {/* Score + View link */}
                 <div className="flex items-center gap-3 flex-shrink-0">
                   <div className="text-center">
                     <div className={`text-2xl font-bold ${
-                      job.match_score >= 70 ? 'text-green-400' :
-                      job.match_score >= 50 ? 'text-blue-400' : 'text-yellow-400'
+                      job.match_tier === 'Top Match' ? 'text-emerald-400' : 'text-blue-400'
                     }`}>{Math.round(job.match_score)}%</div>
                     <div className="text-gray-600 text-xs">match</div>
                   </div>
-                  <div className="flex flex-col gap-2">
-                    {job.job_url && (
-                      <a href={job.job_url} target="_blank" rel="noopener noreferrer"
-                        className="text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 px-3 py-1.5 rounded-lg transition text-center">
-                        View
-                      </a>
-                    )}
-                    {job.status === 'matched' && (
-                      <button
-                        onClick={() => applyJob(job)}
-                        disabled={applying === job.id}
-                        className="text-sm bg-blue-700 hover:bg-blue-600 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg transition font-medium">
-                        {applying === job.id ? 'Working…' : 'Apply'}
-                      </button>
-                    )}
-                  </div>
+                  {job.job_url && (
+                    <a href={job.job_url} target="_blank" rel="noopener noreferrer"
+                      className="text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 px-3 py-1.5 rounded-lg transition text-center">
+                      View
+                    </a>
+                  )}
                 </div>
               </div>
 
-              {/* API key prompt */}
-              {apiKeyPrompt && apiKeyPrompt.jobId === job.id && (
-                <div className="mt-3 bg-gray-800 border border-gray-700 rounded-lg p-4">
-                  <p className="text-gray-300 text-sm mb-2 font-medium">Enter your OpenAI API key to generate the application email:</p>
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      value={apiKeyPrompt.key}
-                      onChange={e => setApiKeyPrompt(p => p ? { ...p, key: e.target.value } : null)}
-                      placeholder="sk-proj-…"
-                      className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-white text-sm placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                    />
-                    <button
-                      onClick={() => { if (apiKeyPrompt.key) applyJob(job, apiKeyPrompt.key) }}
-                      disabled={!apiKeyPrompt.key}
-                      className="bg-blue-700 hover:bg-blue-600 disabled:opacity-50 text-white text-sm px-4 py-1.5 rounded-lg transition font-medium">
-                      Apply
-                    </button>
-                    <button
-                      onClick={() => setApiKeyPrompt(null)}
-                      className="text-gray-500 hover:text-gray-300 text-sm px-3 py-1.5 rounded-lg transition">
-                      Cancel
-                    </button>
-                  </div>
-                  <p className="text-gray-600 text-xs mt-1">Your key is saved locally in this browser for future use.</p>
-                </div>
-              )}
-
-              {/* Feedback messages */}
-              {msg && msg.id === job.id && (
-                <div className={`mt-3 text-sm px-3 py-2 rounded-lg ${
-                  msg.type === 'ok'
-                    ? 'bg-green-950 border border-green-800 text-green-300'
-                    : 'bg-red-950 border border-red-800 text-red-300'
-                }`}>
-                  {msg.text}
-                </div>
-              )}
+              {/* Recruiter finder — always visible on every job */}
+              <RecruiterFinder company={job.company || ''} jobUrl={job.job_url || ''} />
             </div>
           ))}
         </div>

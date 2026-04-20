@@ -18,11 +18,133 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        from db.database import verify_db_connection
+        from db.database import verify_db_connection, AsyncSessionLocal
         await verify_db_connection()
         print("[OK] Database connected")
+
+        # Safe schema migrations — add new columns/tables without breaking existing data
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            migrations = [
+                # New columns on job_matches
+                "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS match_tier TEXT;",
+                "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS source TEXT;",
+                "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS portal_type TEXT;",
+                "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS matched_skills JSONB;",
+                "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS missing_skills JSONB;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS resume_original_name TEXT;",
+                # Portal accounts table
+                """
+                CREATE TABLE IF NOT EXISTS portal_accounts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    portal_name TEXT NOT NULL,
+                    portal_url TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    encrypted_password TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    last_used_at TIMESTAMPTZ
+                );
+                """,
+                # Applications table
+                """
+                CREATE TABLE IF NOT EXISTS applications (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    job_id UUID REFERENCES job_matches(id) ON DELETE CASCADE,
+                    method TEXT NOT NULL,
+                    portal_name TEXT,
+                    confirmation_id TEXT,
+                    status TEXT DEFAULT 'submitted',
+                    applied_at TIMESTAMPTZ DEFAULT now(),
+                    notes JSONB
+                );
+                """,
+                # Notifications table
+                """
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    is_read BOOLEAN DEFAULT false,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                );
+                """,
+                # Portal blacklist table
+                """
+                CREATE TABLE IF NOT EXISTS portal_blacklist (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    portal_name TEXT NOT NULL,
+                    portal_url TEXT,
+                    reason TEXT,
+                    failure_count INTEGER DEFAULT 1,
+                    last_failed_at TIMESTAMPTZ DEFAULT now()
+                );
+                """,
+                # Resume versions table
+                """
+                CREATE TABLE IF NOT EXISTS resume_versions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    version_number INTEGER NOT NULL DEFAULT 1,
+                    label TEXT,
+                    file_path TEXT NOT NULL,
+                    notes TEXT,
+                    is_active BOOLEAN DEFAULT true,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                );
+                """,
+                # Session tokens table
+                """
+                CREATE TABLE IF NOT EXISTS session_tokens (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    portal_name TEXT NOT NULL,
+                    cookies_json TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    UNIQUE (user_id, portal_name)
+                );
+                """,
+                # User preferences table
+                """
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+                    preferred_roles TEXT,
+                    preferred_locations TEXT,
+                    salary_min INTEGER,
+                    salary_max INTEGER,
+                    job_type TEXT,
+                    open_to_remote BOOLEAN DEFAULT true,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                );
+                """,
+            ]
+            for sql in migrations:
+                try:
+                    await session.execute(text(sql))
+                except Exception as e:
+                    print(f"[WARN] Migration skipped: {e}")
+            await session.commit()
+        print("[OK] Schema migrations applied")
+        # Keep-alive: ping Neon every 4 minutes so the connection pool never goes cold
+        async def _keepalive():
+            import asyncio as _asyncio
+            while True:
+                await _asyncio.sleep(240)
+                try:
+                    async with AsyncSessionLocal() as s:
+                        await s.execute(text("SELECT 1"))
+                except Exception:
+                    pass
+        import asyncio as _asyncio
+        _asyncio.create_task(_keepalive())
+        print("[OK] DB keep-alive started (240s interval)")
     except Exception as e:
-        print(f"[WARN] Database connection failed: {e}")
+        print(f"[WARN] Startup error: {e}")
     yield
 
 

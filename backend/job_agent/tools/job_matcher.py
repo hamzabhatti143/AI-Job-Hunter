@@ -1,5 +1,11 @@
-"""STEP 4 — Score and rank jobs. Strict 65% threshold + role conflict exclusion."""
+"""STEP 4 — Score and rank jobs.
+Scoring weights: Skills 40 | Experience 20 | Location 20 | Role Title 10 | Salary 10
+Threshold: 50% minimum AND 2+ skill matches (when resume has skills).
+Flag 70%+ as "Top Match", 50-69% as "Good Match".
+Sort: matched_skills count desc → match_score desc.
+"""
 import json
+import re
 import uuid as uuid_module
 from agents import function_tool
 from db.database import AsyncSessionLocal
@@ -7,7 +13,6 @@ from db.models import JobMatch
 
 STOP_WORDS = {'a','an','the','and','or','for','in','at','to','of','with','is','are','be','as','on','it','i'}
 
-# Direct aliases — treated as exact equivalents for scoring
 ROLE_DIRECT_ALIASES: dict[str, list[str]] = {
     "developer": ["engineer", "programmer", "dev"],
     "engineer":  ["developer", "programmer", "dev"],
@@ -22,14 +27,12 @@ ROLE_DIRECT_ALIASES: dict[str, list[str]] = {
     "scientist": ["researcher"],
 }
 
-# Words that signal an OPPOSITE role — if these appear in a job title
-# and the role_preference word is the key, exclude the job entirely
 ROLE_CONFLICTS: dict[str, list[str]] = {
     "frontend":  ["backend", "back-end", "devops", "infrastructure", "data science",
                   "machine learning", "security engineer", "qa engineer", "test engineer",
                   "data analyst", "data engineer", "mlops", "platform engineer"],
     "backend":   ["frontend", "front-end", "ui/ux", "product designer"],
-    "fullstack":  ["devops", "data scientist", "machine learning", "security"],
+    "fullstack": ["devops", "data scientist", "machine learning", "security"],
     "designer":  ["backend", "devops", "data", "security", "qa"],
     "devops":    ["frontend", "data scientist", "machine learning"],
     "seo":       ["backend engineer", "frontend engineer", "devops", "data scientist",
@@ -37,9 +40,12 @@ ROLE_CONFLICTS: dict[str, list[str]] = {
     "data":      ["frontend developer", "devops", "designer"],
 }
 
+_SENIOR_WORDS = {"senior", "lead", "principal", "staff", "head", "director", "vp", "architect"}
+_MID_WORDS    = {"mid", "intermediate", "associate"}
+_JUNIOR_WORDS = {"junior", "entry", "intern", "trainee", "fresher", "graduate", "jr"}
+
 
 def _word_in_text(word: str, text: str) -> bool:
-    """Check word or any of its direct aliases appear in text."""
     if word in text:
         return True
     for alias in ROLE_DIRECT_ALIASES.get(word, []):
@@ -49,12 +55,57 @@ def _word_in_text(word: str, text: str) -> bool:
 
 
 def _is_conflicting(role_words: list[str], title: str) -> bool:
-    """Return True if job title clearly conflicts with the role preference."""
     for rw in role_words:
         for conflict in ROLE_CONFLICTS.get(rw, []):
             if conflict in title:
                 return True
     return False
+
+
+def _parse_salary_range(text: str) -> tuple[int | None, int | None]:
+    """Extract min/max annual salary from text (USD/PKR/GBP etc.)."""
+    patterns = [
+        r'\$\s*(\d{1,3}(?:,\d{3})*|\d+)k?\s*[-–to]+\s*\$?\s*(\d{1,3}(?:,\d{3})*|\d+)k?',
+        r'(\d{2,3}),?000\s*[-–to]+\s*(\d{2,3}),?000',
+        r'(\d+)\s*lpa?\s*[-–to]+\s*(\d+)\s*lpa?',  # Indian LPA format
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            def _to_num(s: str) -> int:
+                s = s.replace(",", "")
+                n = float(s)
+                if n < 1000:  # likely 'k' shorthand
+                    n *= 1000
+                return int(n)
+            try:
+                return _to_num(m.group(1)), _to_num(m.group(2))
+            except Exception:
+                pass
+    return None, None
+
+
+def _experience_salary_fit(salary_min: int | None, experience_years: int) -> int:
+    """Return salary fit score (0-10). Neutral (5) when no salary data."""
+    if salary_min is None:
+        return 5  # neutral — most APIs don't expose salary
+
+    # Very rough USD annual salary brackets by experience
+    BRACKETS = [
+        (0, 2,  20_000,  60_000),
+        (2, 5,  50_000, 100_000),
+        (5, 10, 80_000, 150_000),
+        (10, 99, 120_000, 999_999),
+    ]
+    for (min_exp, max_exp, sal_low, sal_high) in BRACKETS:
+        if min_exp <= experience_years < max_exp:
+            if sal_low <= salary_min <= sal_high:
+                return 10
+            elif salary_min < sal_low * 0.5:
+                return 2   # too low for experience
+            else:
+                return 6   # ok
+    return 5
 
 
 async def job_matcher_impl(
@@ -65,17 +116,20 @@ async def job_matcher_impl(
     user_id: str = "",
     role_preference: str = "",
 ) -> str:
-    raw = json.loads(jobs_json)
+    raw  = json.loads(jobs_json)
     jobs = raw.get("jobs", []) if isinstance(raw, dict) else raw
 
     raw_skills = json.loads(skills_json)
-    skills = raw_skills.get("skills", []) if isinstance(raw_skills, dict) else raw_skills
+    skills     = raw_skills.get("skills", []) if isinstance(raw_skills, dict) else raw_skills
     skills_lower = {s.lower() for s in skills}
 
     core_role_words = [
         w for w in role_preference.lower().split()
         if w not in STOP_WORDS and len(w) > 2
     ] if role_preference else []
+
+    user_loc = location.lower().strip()
+    user_wants_remote = user_loc in ("remote", "anywhere", "worldwide", "wfh", "work from home", "")
 
     scored = []
 
@@ -84,87 +138,138 @@ async def job_matcher_impl(
             continue
 
         title       = job.get("title", "").lower()
-        tags_list   = [t.lower() for t in job.get("tags", [])]
+        tags_list   = [t.lower() for t in (job.get("tags") or [])]
         tags_text   = " ".join(tags_list)
-        description = (job.get("description", "") or "").lower()
-        title_tags  = f"{title} {tags_text}"          # primary signal
-        full_text   = f"{title_tags} {description}"   # all text for skill scan
+        description = (job.get("description") or "").lower()
+        title_tags  = f"{title} {tags_text}"
+        full_text   = f"{title_tags} {description}"
 
-        # ── Hard exclude: role conflict ─────────────────────────────
+        # Hard exclude conflicting roles
         if core_role_words and _is_conflicting(core_role_words, title):
             continue
 
         score = 0.0
 
-        # ── 1. Role relevance (50 pts) ─────────────────────────────
+        # ── 1. Role title relevance (10 pts) ──────────────────────────
         if core_role_words:
-            # Count how many core role words (or their direct aliases) appear in title+tags
-            hits = sum(1 for w in core_role_words if _word_in_text(w, title_tags))
+            hits  = sum(1 for w in core_role_words if _word_in_text(w, title_tags))
             ratio = hits / len(core_role_words)
-
             if ratio == 1.0:
-                role_score = 50   # all words matched
+                score += 10
             elif ratio >= 0.5:
-                role_score = 32   # majority matched
+                score += 7
             elif ratio > 0:
-                role_score = 16   # minority matched (one word)
+                score += 4
             else:
-                # Zero role words/aliases in title+tags — skip
-                continue
-
-            score += role_score
+                continue  # zero role words in title — skip
         else:
-            score += 25  # no preference → neutral
+            score += 5  # no preference → neutral
 
-        # ── 2. Skill overlap (30 pts) ──────────────────────────────
-        matched_skills = [s for s in skills_lower if s in full_text]
+        # ── 2. Skills match (40 pts) ───────────────────────────────────
         if skills_lower:
-            base_skill = (len(matched_skills) / len(skills_lower)) * 30
-            # Extra: skills appearing in title/tags are stronger signals
-            title_skill_hits = sum(1 for s in skills_lower if s in title_tags)
-            bonus = min(title_skill_hits * 2, 8)
-            score += min(base_skill + bonus, 30)
-
-        # ── 3. Location (15 pts) ───────────────────────────────────
-        job_loc = job.get("location", "").lower()
-        user_loc = location.lower().strip()
-        job_is_remote = any(w in job_loc for w in ["remote", "worldwide", "anywhere", "global"])
-        if job_is_remote:
-            score += 15  # remote jobs are accessible from anywhere
-        elif user_loc and user_loc in job_loc:
-            score += 15  # exact location match
-        elif user_loc in ("remote", "anywhere", "worldwide"):
-            score += 15  # user explicitly wants remote
-
-        # ── 4. Seniority alignment (5 pts max) ────────────────────
-        if experience_years >= 5 and any(w in title for w in ["senior","lead","principal","staff","head"]):
-            score += 5
-        elif 2 <= experience_years < 5 and any(w in title for w in ["mid","intermediate"]):
-            score += 5
-        elif experience_years < 2 and any(w in title for w in ["junior","entry","associate","intern","trainee"]):
-            score += 5
+            matched_skills = [s for s in skills_lower if s in full_text]
+            base = (len(matched_skills) / len(skills_lower)) * 35
+            title_hits = sum(1 for s in skills_lower if s in title_tags)
+            bonus = min(title_hits * 1.5, 5)
+            score += min(base + bonus, 40)
         else:
-            score += 1  # minimal bonus — don't let seniority mismatch kill score entirely
+            score += 20  # no skills to compare → neutral
+
+        # ── 3. Experience level match (20 pts) ────────────────────────
+        has_senior = any(w in title for w in _SENIOR_WORDS)
+        has_mid    = any(w in title for w in _MID_WORDS)
+        has_junior = any(w in title for w in _JUNIOR_WORDS)
+
+        if experience_years >= 7:
+            if has_senior:          score += 20
+            elif not has_junior:    score += 13
+            else:                   score += 3
+        elif experience_years >= 3:
+            if has_mid or has_senior: score += 20
+            elif not has_junior:      score += 16
+            else:                     score += 8
+        elif experience_years >= 1:
+            if has_junior or has_mid: score += 20
+            elif not has_senior:      score += 15
+            else:                     score += 5
+        else:
+            if has_junior:          score += 20
+            elif not has_senior:    score += 12
+            else:                   score += 4
+
+        # ── 4. Location match (20 pts) ────────────────────────────────
+        job_loc = job.get("location", "").lower()
+        job_is_remote = any(w in job_loc for w in ["remote", "worldwide", "anywhere", "global", "wfh"])
+
+        if user_wants_remote:
+            score += 20 if job_is_remote else 8
+        elif job_is_remote:
+            score += 0  # user wants specific location — remote gets no location points
+        else:
+            # Try city match, then country match
+            matched_loc = False
+            for term in user_loc.replace(",", " ").split():
+                if len(term) > 2 and term in job_loc:
+                    score += 20
+                    matched_loc = True
+                    break
+            if not matched_loc:
+                score += 0  # strict: no location match = 0 (not penalized but no bonus)
+
+        # ── 5. Salary fit (10 pts) ────────────────────────────────────
+        sal_min, _ = _parse_salary_range(full_text)
+        score += _experience_salary_fit(sal_min, experience_years)
+
+        matched_skills_list = [s for s in skills_lower if s in full_text] if skills_lower else []
+        missing_skills_list = [s for s in skills_lower if s not in full_text] if skills_lower else []
+
+        # Adaptive per-job skill threshold — description-length aware.
+        # Many Pakistan/onsite boards return jobs with empty descriptions.
+        # Penalising those for 0 skill matches would discard every real job.
+        desc_len = len((job.get("description") or ""))
+        if not skills_lower or desc_len < 100:
+            per_job_threshold = 0   # can't judge skills — no description
+        elif desc_len < 350:
+            per_job_threshold = 1   # short description — require 1 match
+        else:
+            per_job_threshold = 2   # rich description — require 2 matches
 
         scored.append({
             **job,
-            "match_score": round(score, 2),
-            "matched_skills": matched_skills,
+            "match_score":       round(score, 2),
+            "matched_skills":    matched_skills_list,
+            "missing_skills":    missing_skills_list,
+            "skill_match_count": len(matched_skills_list),
+            "_skill_threshold":  per_job_threshold,
         })
 
-    # ── Strict 65% threshold — no fallback ────────────────────────
-    matched = sorted(
-        [j for j in scored if j["match_score"] >= 65],
-        key=lambda x: -x["match_score"]
-    )[:20]
+    # ── Dual threshold:
+    #    1) score ≥ 50 (overall quality)
+    #    2) per-job skill match threshold (adaptive, see above)
+    # ────────────────────────────────────────────────────────────────────
+    def _qualifies(j: dict) -> bool:
+        if j["match_score"] < 50:
+            return False
+        threshold = j.get("_skill_threshold", 0)
+        if threshold and j["skill_match_count"] < threshold:
+            return False
+        return True
+
+    qualified = sorted(
+        [j for j in scored if _qualifies(j)],
+        key=lambda x: (-x["skill_match_count"], -x["match_score"]),
+    )[:25]
+
+    for job in qualified:
+        job["match_tier"] = "Top Match" if job["match_score"] >= 70 else "Good Match"
 
     # Save to DB
     matched_with_ids = []
-    if user_id and matched:
+    if user_id and qualified:
         try:
             async with AsyncSessionLocal() as session:
                 async with session.begin():
-                    for job in matched:
+                    for job in qualified:
                         job_id = uuid_module.uuid4()
                         session.add(JobMatch(
                             id=job_id,
@@ -172,15 +277,19 @@ async def job_matcher_impl(
                             job_title=(job.get("title") or "")[:500],
                             company=(job.get("company") or "")[:500],
                             match_score=job["match_score"],
+                            match_tier=job.get("match_tier"),
                             job_url=job.get("url", ""),
                             location=job.get("location", ""),
+                            source=job.get("source", ""),
                             status="matched",
+                            matched_skills=job.get("matched_skills") or [],
+                            missing_skills=job.get("missing_skills") or [],
                         ))
                         matched_with_ids.append({**job, "db_job_id": str(job_id)})
         except Exception:
-            matched_with_ids = matched
+            matched_with_ids = qualified
     else:
-        matched_with_ids = matched
+        matched_with_ids = qualified
 
     return json.dumps({
         "success": True,
@@ -191,17 +300,13 @@ async def job_matcher_impl(
 
 @function_tool
 async def job_matcher_tool(
-    jobs_json: str,
-    skills_json: str,
-    experience_years: int,
-    location: str,
-    user_id: str = "",
-    role_preference: str = "",
+    jobs_json: str, skills_json: str, experience_years: int,
+    location: str, user_id: str = "", role_preference: str = "",
 ) -> str:
-    """Strict role-aware job scorer. 65% minimum threshold.
-    Conflicting roles (e.g. backend jobs when frontend requested) are hard-excluded.
-    Returns JSON with matched_jobs (each has db_job_id) and total_matched count.
-    """
+    """Score and rank jobs. Weights: Skills 40 | Experience 20 | Location 20 | Role 10 | Salary 10.
+    Threshold: ≥50% score AND ≥2 skill matches (when resume has 3+ skills).
+    70%+ flagged as 'Top Match'. 50-69% flagged as 'Good Match'.
+    Returns matched_skills and missing_skills per job. Sorted by skill match count then score."""
     return await job_matcher_impl(
         jobs_json=jobs_json, skills_json=skills_json,
         experience_years=experience_years, location=location,

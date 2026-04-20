@@ -18,6 +18,7 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     resume_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resume_original_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Mail credentials (stored for reuse in pipeline)
     smtp_host: Mapped[str | None] = mapped_column(Text, nullable=True)
     smtp_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -40,9 +41,14 @@ class JobMatch(Base):
     job_title: Mapped[str] = mapped_column(Text, nullable=False)
     company: Mapped[str] = mapped_column(Text, nullable=False)
     match_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    match_tier: Mapped[str | None] = mapped_column(Text, nullable=True)   # "Top Match" | "Good Match"
     job_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     location: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str | None] = mapped_column(Text, nullable=True)        # remoteok | serpapi | etc.
+    portal_type: Mapped[str | None] = mapped_column(Text, nullable=True)   # Workday | Greenhouse | etc.
     status: Mapped[str] = mapped_column(Text, default="matched", index=True)
+    matched_skills: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    missing_skills: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
     user: Mapped["User"] = relationship(back_populates="job_matches")
@@ -109,3 +115,54 @@ class ActivityLog(Base):
     logged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
     user: Mapped["User"] = relationship(back_populates="activity_logs")
+
+
+class UserPreference(Base):
+    """Stores user job-search preferences to avoid re-entering every session."""
+    __tablename__ = "user_preferences"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
+    preferred_roles: Mapped[str | None] = mapped_column(Text, nullable=True)      # comma-separated
+    preferred_locations: Mapped[str | None] = mapped_column(Text, nullable=True)  # comma-separated
+    salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)        # USD annual
+    salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    job_type: Mapped[str | None] = mapped_column(Text, nullable=True)             # full-time|contract|part-time
+    open_to_remote: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    user: Mapped["User"] = relationship("User")
+
+
+class PortalAccount(Base):
+    """Stores credentials for job portal accounts (e.g. LinkedIn, Workday)."""
+    __tablename__ = "portal_accounts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    portal_name: Mapped[str] = mapped_column(Text, nullable=False)
+    portal_url: Mapped[str] = mapped_column(Text, nullable=False)
+    username: Mapped[str] = mapped_column(Text, nullable=False)
+    encrypted_password: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship("User")
+
+
+class Application(Base):
+    """Tracks every job application — email or portal — with status and confirmation."""
+    __tablename__ = "applications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("job_matches.id", ondelete="CASCADE"), nullable=True, index=True)
+    method: Mapped[str] = mapped_column(Text, nullable=False)           # 'email' | 'portal'
+    portal_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confirmation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, default="submitted", index=True)  # submitted | failed | pending
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    notes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    user: Mapped["User"] = relationship("User")
+    job: Mapped["JobMatch | None"] = relationship("JobMatch")
