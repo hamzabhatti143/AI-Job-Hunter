@@ -237,8 +237,17 @@ async def send_draft_email(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a drafted email via the user's configured SMTP credentials."""
-    # Check SMTP is configured
-    if not (current_user.smtp_host and current_user.smtp_user and current_user.smtp_password):
+    # Snapshot all user fields immediately — prevents DetachedInstanceError if the
+    # ORM instance loses its session binding during the async SMTP call below.
+    user_id       = current_user.id
+    smtp_host     = current_user.smtp_host
+    smtp_port     = current_user.smtp_port or 587
+    smtp_user     = current_user.smtp_user
+    smtp_password = current_user.smtp_password
+    resume_path   = current_user.resume_path
+    resume_name   = current_user.resume_original_name
+
+    if not (smtp_host and smtp_user and smtp_password):
         raise HTTPException(
             status_code=400,
             detail="SMTP not configured. Go to Settings to add your email credentials."
@@ -248,7 +257,7 @@ async def send_draft_email(
     draft = (await db.execute(
         select(PendingEmail).where(
             PendingEmail.id == uuid.UUID(draft_id),
-            PendingEmail.user_id == current_user.id,
+            PendingEmail.user_id == user_id,
         )
     )).scalar_one_or_none()
     if not draft:
@@ -262,15 +271,14 @@ async def send_draft_email(
     subject = content.get("subject", "Job Application")
     body = content.get("body", "")
 
-    # Build MIME message — mixed so we can attach resume
+    # Build MIME message
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
-    msg["From"] = current_user.smtp_user
+    msg["From"] = smtp_user
     msg["To"] = recipient_email
     msg.attach(MIMEText(body, "plain"))
 
     # Attach resume if available
-    resume_path = current_user.resume_path
     resume_attached = False
     if resume_path and os.path.exists(resume_path):
         try:
@@ -278,21 +286,20 @@ async def send_draft_email(
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(rf.read())
             encoders.encode_base64(part)
-            display_name = current_user.resume_original_name or os.path.basename(resume_path)
+            display_name = resume_name or os.path.basename(resume_path)
             part.add_header("Content-Disposition", "attachment", filename=display_name)
             msg.attach(part)
             resume_attached = True
         except Exception:
-            pass  # Don't fail send if attach fails
+            pass
 
     # Send via SMTP
     try:
-        port = current_user.smtp_port or 587
-        with smtplib.SMTP(current_user.smtp_host, port, timeout=15) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
             server.ehlo()
             server.starttls()
-            server.login(current_user.smtp_user, current_user.smtp_password)
-            server.sendmail(current_user.smtp_user, recipient_email, msg.as_string())
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, recipient_email, msg.as_string())
     except smtplib.SMTPAuthenticationError:
         raise HTTPException(status_code=400, detail="SMTP authentication failed. Check your email credentials in Settings.")
     except smtplib.SMTPRecipientsRefused:
@@ -304,14 +311,13 @@ async def send_draft_email(
 
     # Record in sent_emails
     db.add(SentEmail(
-        user_id=current_user.id,
+        user_id=user_id,
         job_id=draft.job_id,
         pending_id=draft.id,
         recipient_email=recipient_email,
         email_content=draft.draft_content,
         resume_attached=resume_attached,
     ))
-    # Mark draft as sent
     await db.execute(
         update(PendingEmail)
         .where(PendingEmail.id == uuid.UUID(draft_id))
