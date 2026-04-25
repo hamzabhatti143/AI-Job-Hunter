@@ -24,6 +24,12 @@ class User(Base):
     smtp_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     smtp_user: Mapped[str | None] = mapped_column(Text, nullable=True)
     smtp_password: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gmail_access_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gmail_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gmail_token_expiry: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    google_client_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    google_client_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    google_redirect_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     job_matches: Mapped[list["JobMatch"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -99,6 +105,9 @@ class SentEmail(Base):
     email_content: Mapped[str] = mapped_column(Text, nullable=False)
     resume_attached: Mapped[bool] = mapped_column(Boolean, default=True)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    gmail_thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reply_content: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="sent_emails")
     job: Mapped["JobMatch"] = relationship(back_populates="sent_emails")

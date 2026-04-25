@@ -2,13 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
-import asyncio, os, uuid, json, traceback, smtplib
-from email.mime.text import MIMEText
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email import encoders
+from email import encoders as email_encoders
+import asyncio, os, uuid, json, traceback, httpx, base64
 from db.database import get_db, AsyncSessionLocal
-from db.models import User, JobMatch, PendingEmail, SentEmail
+from db.models import User, JobMatch, PendingEmail, SentEmail, utcnow
 from api.routes.auth import get_current_user, invalidate_user_cache
 from fastapi.security import OAuth2PasswordBearer
 _oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -34,6 +35,87 @@ def _delete_file(path: str):
             os.remove(path)
     except Exception:
         pass
+
+
+async def _get_valid_gmail_token(user: User, db: AsyncSession) -> str:
+    """Return a valid Gmail access token, refreshing it if expired or near-expiry."""
+    now = datetime.now(timezone.utc)
+    needs_refresh = (
+        not user.gmail_access_token
+        or not user.gmail_token_expiry
+        or user.gmail_token_expiry <= now + timedelta(minutes=2)
+    )
+    if needs_refresh:
+        if not user.gmail_refresh_token:
+            raise ValueError("Gmail not connected — please connect Gmail in Settings")
+        async with httpx.AsyncClient() as client:
+            r = await client.post("https://oauth2.googleapis.com/token", data={
+                "client_id":     user.google_client_id     or os.getenv("GOOGLE_CLIENT_ID", ""),
+                "client_secret": user.google_client_secret or os.getenv("GOOGLE_CLIENT_SECRET", ""),
+                "refresh_token": user.gmail_refresh_token,
+                "grant_type":    "refresh_token",
+            })
+            if r.status_code != 200:
+                raise ValueError("Gmail token refresh failed — please reconnect Gmail in Settings")
+            tokens = r.json()
+        user.gmail_access_token = tokens["access_token"]
+        user.gmail_token_expiry = datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))
+        db.add(user)
+        await db.commit()
+    return user.gmail_access_token
+
+
+async def _send_via_gmail(
+    user: User,
+    db: AsyncSession,
+    to: str,
+    subject: str,
+    body: str,
+    attachment_bytes: bytes | None = None,
+    attachment_name: str | None = None,
+) -> str:
+    """Send via Gmail API. Returns threadId for reply tracking."""
+    access_token = await _get_valid_gmail_token(user, db)
+
+    msg = MIMEMultipart()
+    msg["To"]      = to
+    msg["From"]    = user.email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    if attachment_bytes and attachment_name:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(attachment_bytes)
+        email_encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=attachment_name)
+        msg.attach(part)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"raw": raw},
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            raise ValueError(f"Gmail API error {r.status_code}: {r.text}")
+        return r.json().get("threadId", "")
+
+
+def _extract_gmail_body(message: dict) -> str:
+    """Extract plain text from a Gmail message payload."""
+    payload = message.get("payload", {})
+    data = payload.get("body", {}).get("data", "")
+    if data:
+        return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+    for part in payload.get("parts", []):
+        if part.get("mimeType") == "text/plain":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+    return ""
 
 
 async def _run_pipeline_task(
@@ -335,25 +417,19 @@ async def send_draft_email(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Send a drafted email via the user's configured SMTP credentials."""
-    # Always re-fetch from DB to get the latest resume_path — the cached user object
-    # from get_current_user may be stale if the resume was uploaded in this session.
+    """Send a drafted email via Gmail API."""
+    # Always re-fetch from DB to get the latest resume_path and Gmail tokens
     fresh_user = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one_or_none()
     u = fresh_user or current_user
 
-    user_id       = u.id
-    smtp_host     = u.smtp_host
-    smtp_port     = u.smtp_port or 587
-    smtp_user     = u.smtp_user
-    smtp_password = u.smtp_password
-    resume_path   = u.resume_path
-    resume_name   = u.resume_original_name
-
-    if not (smtp_host and smtp_user and smtp_password):
+    if not u.gmail_refresh_token:
         raise HTTPException(
             status_code=400,
-            detail="SMTP not configured. Go to Settings to add your email credentials."
+            detail="Gmail not connected. Connect Gmail in Settings to send emails."
         )
+    user_id    = u.id
+    resume_path = u.resume_path
+    resume_name = u.resume_original_name
 
     # Load draft
     draft = (await db.execute(
@@ -371,16 +447,11 @@ async def send_draft_email(
         content = {"subject": "Job Application", "body": draft.draft_content}
 
     subject = content.get("subject", "Job Application")
-    body = content.get("body", "")
+    body    = content.get("body", "")
 
-    # Build MIME message
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = recipient_email
-    msg.attach(MIMEText(body, "plain"))
+    sent_id = uuid.uuid4()
 
-    # Resolve resume path — fall back to scanning RESUME_DIR if stored path is stale
+    # Resolve and read resume bytes
     def _resolve_resume(stored_path: str, uid: str) -> str:
         if stored_path and os.path.exists(stored_path):
             return stored_path
@@ -393,47 +464,37 @@ async def send_draft_email(
         return ""
 
     resolved_resume = _resolve_resume(resume_path or "", str(user_id))
-
-    # Attach resume
-    resume_attached = False
+    attachment_bytes: bytes | None = None
     attached_filename = ""
+    resume_attached = False
+
     if resolved_resume:
         try:
             with open(resolved_resume, "rb") as rf:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(rf.read())
-            encoders.encode_base64(part)
+                attachment_bytes = rf.read()
             attached_filename = resume_name or os.path.basename(resolved_resume)
-            part.add_header("Content-Disposition", "attachment", filename=attached_filename)
-            msg.attach(part)
             resume_attached = True
-        except Exception as e:
+        except Exception:
             traceback.print_exc()
 
-    # Send via SMTP
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, recipient_email, msg.as_string())
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(status_code=400, detail="SMTP authentication failed. Check your email credentials in Settings.")
-    except smtplib.SMTPRecipientsRefused:
-        raise HTTPException(status_code=400, detail=f"Recipient email '{recipient_email}' was refused by the mail server.")
-    except smtplib.SMTPException as exc:
-        raise HTTPException(status_code=500, detail=f"SMTP error: {exc}")
+        gmail_thread_id = await _send_via_gmail(
+            user=u, db=db, to=recipient_email, subject=subject, body=body,
+            attachment_bytes=attachment_bytes, attachment_name=attached_filename or None,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to send email: {exc}")
 
-    # Record in sent_emails
+    # Record send
     db.add(SentEmail(
+        id=sent_id,
         user_id=user_id,
         job_id=draft.job_id,
         pending_id=draft.id,
         recipient_email=recipient_email,
         email_content=draft.draft_content,
         resume_attached=resume_attached,
+        gmail_thread_id=gmail_thread_id or None,
     ))
     await db.execute(
         update(PendingEmail)
@@ -443,8 +504,66 @@ async def send_draft_email(
     await db.commit()
 
     return {
-        "success":           True,
-        "message":           f"Email sent to {recipient_email}",
-        "resume_attached":   resume_attached,
-        "resume_filename":   attached_filename,
+        "success":         True,
+        "message":         f"Email sent to {recipient_email}",
+        "resume_attached": resume_attached,
+        "resume_filename": attached_filename,
     }
+
+
+@router.post("/check-replies")
+async def check_replies(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll Gmail threads for recruiter replies. Called when user opens Sent page."""
+    if not current_user.gmail_refresh_token:
+        return {"checked": 0, "new_replies": 0}
+
+    rows = (await db.execute(
+        select(SentEmail).where(
+            SentEmail.user_id == current_user.id,
+            SentEmail.gmail_thread_id.isnot(None),
+            SentEmail.replied_at.is_(None),
+        )
+    )).scalars().all()
+
+    if not rows:
+        return {"checked": 0, "new_replies": 0}
+
+    fresh = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one_or_none()
+    u = fresh or current_user
+
+    try:
+        access_token = await _get_valid_gmail_token(u, db)
+    except Exception:
+        return {"checked": 0, "new_replies": 0}
+
+    new_replies = 0
+    async with httpx.AsyncClient() as client:
+        for sent in rows:
+            try:
+                r = await client.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{sent.gmail_thread_id}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    continue
+                messages = r.json().get("messages", [])
+                if len(messages) <= 1:
+                    continue
+                reply_text = _extract_gmail_body(messages[1])
+                sent.replied_at    = utcnow()
+                sent.reply_content = reply_text[:5000]
+                db.add(sent)
+                new_replies += 1
+            except Exception:
+                continue
+
+    if new_replies:
+        await db.commit()
+
+    return {"checked": len(rows), "new_replies": new_replies}
+
+

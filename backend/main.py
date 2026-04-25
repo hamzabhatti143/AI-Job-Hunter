@@ -33,6 +33,15 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS matched_skills JSONB;",
                 "ALTER TABLE job_matches ADD COLUMN IF NOT EXISTS missing_skills JSONB;",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS resume_original_name TEXT;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_access_token TEXT;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_refresh_token TEXT;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token_expiry TIMESTAMPTZ;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_client_id TEXT;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_client_secret TEXT;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_redirect_uri TEXT;",
+                "ALTER TABLE sent_emails ADD COLUMN IF NOT EXISTS gmail_thread_id TEXT;",
+                "ALTER TABLE sent_emails ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ;",
+                "ALTER TABLE sent_emails ADD COLUMN IF NOT EXISTS reply_content TEXT;",
                 # Portal accounts table
                 """
                 CREATE TABLE IF NOT EXISTS portal_accounts (

@@ -8,6 +8,7 @@ const sidebarItems = [
   { href: '/dashboard/jobs', label: 'Matched Jobs', icon: '🎯' },
   { href: '/dashboard/drafts', label: 'Application Drafts', icon: '✍️' },
   { href: '/dashboard/applied', label: 'Applied', icon: '📤' },
+  { href: '/dashboard/sent', label: 'Sent Emails', icon: '✉️' },
   { href: '/dashboard/analytics', label: 'Analytics', icon: '📊' },
   { href: '/dashboard/preferences', label: 'Preferences', icon: '🔧' },
   { href: '/dashboard/guide', label: 'Guide', icon: '📖' },

@@ -98,8 +98,12 @@ async def get_mail_data(current_user: User = Depends(get_current_user), db: Asyn
 async def get_sent_data(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(SentEmail).where(SentEmail.user_id == current_user.id).order_by(SentEmail.sent_at.desc()))).scalars().all()
     return [
-        {"id": str(r.id), "recipient_email": r.recipient_email, "email_content": r.email_content,
-         "resume_attached": r.resume_attached, "sent_at": r.sent_at.isoformat(), "job_id": str(r.job_id)}
+        {
+            "id": str(r.id), "recipient_email": r.recipient_email, "email_content": r.email_content,
+            "resume_attached": r.resume_attached, "sent_at": r.sent_at.isoformat(), "job_id": str(r.job_id),
+            "replied_at": r.replied_at.isoformat() if r.replied_at else None,
+            "reply_content": r.reply_content or None,
+        }
         for r in rows
     ]
 
