@@ -1,10 +1,10 @@
 'use client'
-export const dynamic = 'force-dynamic'
+import { Suspense } from 'react'
 import { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import api from '@/lib/api'
 
-export default function SettingsPage() {
+function SettingsInner() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const [email, setEmail] = useState('')
@@ -142,7 +142,6 @@ export default function SettingsPage() {
 
         {gmailConnected ? (
           <div className="space-y-4">
-            {/* What's active */}
             <div className="divide-y divide-gray-800 rounded-xl overflow-hidden border border-gray-800 text-sm">
               <div className="bg-gray-950 px-5 py-3 grid grid-cols-5 gap-4">
                 <div className="col-span-2 text-white font-medium">FROM address</div>
@@ -164,7 +163,6 @@ export default function SettingsPage() {
           </div>
         ) : (
           <div className="space-y-4">
-            {/* Credentials inputs */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-500">Enter manually or upload your credentials file</span>
@@ -228,5 +226,13 @@ export default function SettingsPage() {
         )}
       </div>
     </div>
+  )
+}
+
+export default function SettingsPage() {
+  return (
+    <Suspense fallback={<div className="text-gray-400 py-12 text-center">Loading settings…</div>}>
+      <SettingsInner />
+    </Suspense>
   )
 }
