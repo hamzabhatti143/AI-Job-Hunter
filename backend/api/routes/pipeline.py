@@ -567,3 +567,180 @@ async def check_replies(
     return {"checked": len(rows), "new_replies": new_replies}
 
 
+@router.post("/find-emails/{job_id}")
+async def find_emails_for_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search Google + scrape company pages and return all found recruiter emails for a job."""
+    from job_agent.tools.email_finder import (
+        _get_search_domain, _company_to_domain_variants, _scrape_emails,
+        _serpapi_email_search, _hunter_search, _generate_hr_emails,
+        _clean_emails, AGGREGATOR_DOMAINS, _extract_domain_from_url,
+        EMAIL_RE, _find_obfuscated_emails, _CAREER_PATHS, _CONTACT_PATHS,
+        _is_system_email, RFC5322_RE,
+    )
+    import re
+
+    job = (await db.execute(
+        select(JobMatch).where(
+            JobMatch.id == uuid.UUID(job_id),
+            JobMatch.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    company = job.company or ""
+    url = job.job_url or ""
+    domain = _get_search_domain(url, company)
+    domain_variants = _company_to_domain_variants(company) if company else []
+    if domain and domain not in domain_variants:
+        domain_variants.insert(0, domain)
+
+    # Collect emails from all sources, labelled by source
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(emails: list[str], source: str):
+        for e in emails:
+            e = e.lower().strip()
+            if e and e not in seen and not _is_system_email(e):
+                seen.add(e)
+                found.append({"address": e, "source": source})
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # 1. Job listing page
+        if url and not any(agg in _extract_domain_from_url(url) for agg in AGGREGATOR_DOMAINS):
+            _add(await _scrape_emails(client, url), "job listing")
+
+        # 2. Careers pages
+        if domain:
+            for path in _CAREER_PATHS[:4]:
+                _add(await _scrape_emails(client, f"https://{domain}{path}"), "careers page")
+
+        # 3. Contact pages
+        if domain:
+            for path in _CONTACT_PATHS[:4]:
+                _add(await _scrape_emails(client, f"https://{domain}{path}"), "contact page")
+
+        # 4. SerpAPI Google search
+        if company:
+            _add(await _serpapi_email_search(client, company, domain), "Google search")
+
+        # 5. Hunter.io
+        if domain:
+            _add(await _hunter_search(client, domain), "Hunter.io")
+
+        # 6. LinkedIn
+        if company:
+            company_slug = re.sub(r"[^a-z0-9]", "-", company.lower()).strip("-")
+            _add(await _scrape_emails(client, f"https://www.linkedin.com/company/{company_slug}/people/"), "LinkedIn")
+
+        # 7. HR email patterns
+        for dv in domain_variants[:3]:
+            hr = await _generate_hr_emails(dv)
+            _add(hr, "pattern (hr@/jobs@/careers@)")
+
+    return {"emails": found, "company": company}
+
+
+from pydantic import BaseModel
+
+class BulkSendItem(BaseModel):
+    draft_id: str
+    recipient_email: str
+
+class BulkSendRequest(BaseModel):
+    items: list[BulkSendItem]
+
+
+@router.post("/bulk-send-emails")
+async def bulk_send_emails_json(
+    req: BulkSendRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send multiple drafted emails at once. Each item needs draft_id + recipient_email."""
+    fresh_user = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one_or_none()
+    u = fresh_user or current_user
+
+    if not u.gmail_refresh_token:
+        raise HTTPException(status_code=400, detail="Gmail not connected. Connect Gmail in Settings to send emails.")
+
+    results = []
+    for item in req.items:
+        try:
+            draft = (await db.execute(
+                select(PendingEmail).where(
+                    PendingEmail.id == uuid.UUID(item.draft_id),
+                    PendingEmail.user_id == current_user.id,
+                    PendingEmail.status == "pending",
+                )
+            )).scalar_one_or_none()
+            if not draft:
+                results.append({"draft_id": item.draft_id, "success": False, "error": "Draft not found or already sent"})
+                continue
+
+            try:
+                content = json.loads(draft.draft_content)
+            except Exception:
+                content = {"subject": "Job Application", "body": draft.draft_content}
+
+            subject = content.get("subject", "Job Application")
+            body    = content.get("body", "")
+
+            # Resolve resume
+            resume_path = u.resume_path or ""
+            resolved_resume = ""
+            if resume_path and os.path.exists(resume_path):
+                resolved_resume = resume_path
+            else:
+                for fname in os.listdir(RESUME_DIR):
+                    if fname.startswith(str(u.id)):
+                        resolved_resume = os.path.join(RESUME_DIR, fname)
+                        break
+
+            attachment_bytes: bytes | None = None
+            attached_filename = ""
+            if resolved_resume:
+                try:
+                    with open(resolved_resume, "rb") as rf:
+                        attachment_bytes = rf.read()
+                    attached_filename = u.resume_original_name or os.path.basename(resolved_resume)
+                except Exception:
+                    pass
+
+            sent_id = uuid.uuid4()
+            gmail_thread_id = await _send_via_gmail(
+                user=u, db=db, to=item.recipient_email,
+                subject=subject, body=body,
+                attachment_bytes=attachment_bytes,
+                attachment_name=attached_filename or None,
+            )
+
+            db.add(SentEmail(
+                id=sent_id,
+                user_id=u.id,
+                job_id=draft.job_id,
+                pending_id=draft.id,
+                recipient_email=item.recipient_email,
+                email_content=draft.draft_content,
+                resume_attached=bool(attachment_bytes),
+                gmail_thread_id=gmail_thread_id or None,
+            ))
+            await db.execute(
+                update(PendingEmail)
+                .where(PendingEmail.id == uuid.UUID(item.draft_id))
+                .values(status="sent")
+            )
+            await db.commit()
+            results.append({"draft_id": item.draft_id, "success": True, "recipient": item.recipient_email})
+
+        except Exception as exc:
+            results.append({"draft_id": item.draft_id, "success": False, "error": str(exc)})
+
+    sent_count = sum(1 for r in results if r["success"])
+    return {"results": results, "sent": sent_count, "total": len(results)}
+
