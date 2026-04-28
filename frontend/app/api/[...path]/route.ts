@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 export const maxDuration = 300 // 5 minutes — pipeline can take a while
 
-const BACKEND = process.env.BACKEND_URL || 'https://hamzabhatti-job-hunter.hf.space'
+const BACKEND = process.env.BACKEND_URL || 'http://localhost:8000'
 
 async function handler(
   req: NextRequest,

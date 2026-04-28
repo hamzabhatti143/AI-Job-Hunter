@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 export async function GET() {
-  const backend = process.env.BACKEND_URL || 'https://hamzabhatti-job-hunter.hf.space'
+  const backend = process.env.BACKEND_URL || 'http://localhost:8000'
   let reachable = false
   try {
     const res = await fetch(`${backend}/health`, { signal: AbortSignal.timeout(5000) })
