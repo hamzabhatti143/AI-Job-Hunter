@@ -131,10 +131,15 @@ def clean_job_fields_sync(title: str, company: str, url: str = "") -> tuple[str,
     """Regex-only cleaning for job-card display. No API calls."""
     raw_t = (title   or "").strip()
     raw_c = (company or "").strip()
+
+    def _display_company(resolved: str) -> str:
+        """Return empty string for placeholder fallbacks — let the frontend show 'Unknown Company'."""
+        return "" if resolved in ("your organization", "your company", "your organisation") else resolved
+
     if not _looks_like_portal(raw_c) and not _is_dirty(raw_t):
-        return _clean_job_title(raw_t), _resolve_company(raw_c, url)
+        return _clean_job_title(raw_t), _display_company(_resolve_company(raw_c, url))
     reg_t, reg_c = _regex_split_dirty(raw_t)
-    return _clean_job_title(reg_t), (reg_c or _resolve_company(raw_c, url))
+    return _clean_job_title(reg_t), (reg_c or _display_company(_resolve_company(raw_c, url)))
 
 
 # ── Resume field extractors ───────────────────────────────────────────────────

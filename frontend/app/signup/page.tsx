@@ -11,7 +11,7 @@ export default function Signup() {
   const router = useRouter()
   const [step, setStep] = useState<Step>('form')
   const [form, setForm] = useState({ name: '', username: '', email: '', password: '', confirmPassword: '' })
-  const [creds, setCreds] = useState({ clientId: '', clientSecret: '', redirectUri: 'https://hamzabhatti-job-hunter.hf.space/auth/gmail/callback' })
+  const [creds, setCreds] = useState({ clientId: '', clientSecret: '', redirectUri: 'http://127.0.0.1:8000/auth/gmail/callback' })
   const [showSecret, setShowSecret] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -181,7 +181,7 @@ export default function Signup() {
                       <>Go to <span className="text-blue-400">console.cloud.google.com</span> → create a project named <span className="bg-gray-800 px-1.5 py-0.5 rounded font-mono text-xs text-gray-200">ApplyAI</span></>,
                       <>Enable <span className="text-white font-medium">Gmail API</span>: APIs & Services → Library → search Gmail API → Enable</>,
                       <>Configure consent screen: APIs & Services → OAuth consent screen → External → fill App name → add scopes <span className="bg-gray-800 px-1.5 py-0.5 rounded font-mono text-xs text-green-400">gmail.send</span> and <span className="bg-gray-800 px-1.5 py-0.5 rounded font-mono text-xs text-green-400">gmail.readonly</span> → add your email as test user</>,
-                      <>Create credentials: APIs & Services → Credentials → Create Credentials → OAuth client ID → Web application → add redirect URI: <span className="bg-gray-800 px-1.5 py-0.5 rounded font-mono text-xs text-green-400">https://hamzabhatti-job-hunter.hf.space/auth/gmail/callback</span></>,
+                      <>Create credentials: APIs & Services → Credentials → Create Credentials → OAuth client ID → Web application → add redirect URI: <span className="bg-gray-800 px-1.5 py-0.5 rounded font-mono text-xs text-green-400">http://127.0.0.1:8000/auth/gmail/callback</span></>,
                       <>Copy the <span className="text-white font-medium">Client ID</span> and <span className="text-white font-medium">Client Secret</span> shown in the dialog and paste below</>,
                     ].map((s, i) => (
                       <li key={i} className="flex gap-3 text-gray-400">
@@ -242,7 +242,7 @@ export default function Signup() {
                       type="text"
                       value={creds.redirectUri}
                       onChange={setCred('redirectUri')}
-                      placeholder="https://hamzabhatti-job-hunter.hf.space/auth/gmail/callback"
+                      placeholder="http://127.0.0.1:8000/auth/gmail/callback"
                       className={inp}
                     />
                     <p className="text-xs text-gray-600 mt-1">Must exactly match the URI you added in Google Cloud Console → Credentials → Authorized redirect URIs.</p>

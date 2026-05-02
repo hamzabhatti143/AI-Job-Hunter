@@ -206,6 +206,8 @@ async def job_matcher_impl(
             score += 20 if job_is_remote else 8
         elif job_is_remote:
             score += 0  # user wants specific location — remote gets no location points
+        elif not job_loc:
+            score += 10  # no location data at all (organic results) — neutral, not a penalty
         else:
             # Try city match, then country match
             matched_loc = False
@@ -215,7 +217,7 @@ async def job_matcher_impl(
                     matched_loc = True
                     break
             if not matched_loc:
-                score += 0  # strict: no location match = 0 (not penalized but no bonus)
+                score += 0  # wrong location confirmed — no points
 
         # ── 5. Salary fit (10 pts) ────────────────────────────────────
         sal_min, _ = _parse_salary_range(full_text)
@@ -248,8 +250,8 @@ async def job_matcher_impl(
     #    1) score ≥ 50 (overall quality)
     #    2) per-job skill match threshold (adaptive, see above)
     # ────────────────────────────────────────────────────────────────────
-    def _qualifies(j: dict) -> bool:
-        if j["match_score"] < 50:
+    def _qualifies(j: dict, min_score: float = 50) -> bool:
+        if j["match_score"] < min_score:
             return False
         threshold = j.get("_skill_threshold", 0)
         if threshold and j["skill_match_count"] < threshold:
@@ -257,9 +259,19 @@ async def job_matcher_impl(
         return True
 
     qualified = sorted(
-        [j for j in scored if _qualifies(j)],
+        [j for j in scored if _qualifies(j, 50)],
         key=lambda x: (-x["skill_match_count"], -x["match_score"]),
-    )[:25]
+    )[:50]
+
+    # Guarantee minimum 20 results — if strict threshold yields fewer,
+    # admit additional jobs at a lower bar (40) until we reach 20.
+    if len(qualified) < 20:
+        qualified_ids = {id(j) for j in qualified}
+        extras = sorted(
+            [j for j in scored if id(j) not in qualified_ids and _qualifies(j, 40)],
+            key=lambda x: (-x["skill_match_count"], -x["match_score"]),
+        )
+        qualified = (qualified + extras)[:50]
 
     for job in qualified:
         job["match_tier"] = "Top Match" if job["match_score"] >= 70 else "Good Match"

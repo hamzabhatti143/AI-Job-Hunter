@@ -596,59 +596,102 @@ async def _google_search_emails(
     company: str,
     domain: str,
     location: str = "",
-) -> list[str]:
-    """Run 3 location-aware Google queries via SerpAPI, extract emails from snippets AND
-    scrape the top result pages directly for maximum coverage."""
+) -> list[dict]:
+    """
+    Run 8 targeted Google queries to find recruiter emails for a company.
+    Returns list of {address, source, query} dicts — deduplicated and validated.
+    """
     from job_agent.tools.email_finder import (
         EMAIL_RE, _find_obfuscated_emails, _clean_emails,
-        _scrape_emails, AGGREGATOR_DOMAINS,
+        _scrape_emails, AGGREGATOR_DOMAINS, _is_system_email,
     )
-    key = os.getenv("SERP_API_KEY", "")
-    if not key:
+    key = os.getenv("SERP_API_KEY") or os.getenv("SERPAPI_KEY", "")
+    if not key or not company:
         return []
 
-    city = location.split(",")[0].strip() if location else ""
-    loc_q = f' "{city}"' if city else ""
+    city    = location.split(",")[0].strip() if location else ""
+    country = location.split(",")[-1].strip() if "," in location else location.strip()
+    loc_q   = f' "{city}"' if city else (f' "{country}"' if country else "")
 
+    # 8 diverse query angles — cast a wide net
     queries = [
-        f'"{company}" recruiter OR "HR" email{loc_q}',
-        f'"{company}" jobs email contact{loc_q}',
-        f'site:{domain} email recruiter' if domain else f'"{company}" hiring email',
+        # 1. Exact email prefix search (most direct)
+        (f'"{company}" "hr@" OR "jobs@" OR "careers@" OR "recruit@" OR "talent@" OR "hiring@"',
+         "email prefix"),
+        # 2. Recruiter contact with location
+        (f'"{company}" recruiter email{loc_q}',
+         "recruiter search"),
+        # 3. HR / talent acquisition
+        (f'"{company}" "talent acquisition" OR "HR manager" email contact',
+         "HR search"),
+        # 4. Hiring manager direct
+        (f'"{company}" "hiring manager" OR "people team" email{loc_q}',
+         "hiring manager"),
+        # 5. Domain scrape (direct)
+        (f'site:{domain} email contact recruiter' if domain else f'"{company}" official email contact',
+         "domain search"),
+        # 6. Job application email
+        (f'"{company}" "apply" OR "application" email address{loc_q}',
+         "application email"),
+        # 7. LinkedIn HR people page
+        (f'site:linkedin.com "{company}" recruiter OR "HR" email',
+         "LinkedIn"),
+        # 8. Recent (current year) — gets fresher results
+        (f'"{company}" HR email 2025{loc_q}',
+         "recent search"),
     ]
 
-    found: list[str] = []
+    found_map: dict[str, dict] = {}   # address → {address, source, query}
     scrape_urls: list[str] = []
 
-    for q in queries:
+    for query_text, source_label in queries:
         try:
             r = await client.get(
                 "https://serpapi.com/search.json",
-                params={"engine": "google", "q": q, "api_key": key, "num": 5},
-                timeout=8,
+                params={
+                    "engine": "google",
+                    "q":       query_text,
+                    "api_key": key,
+                    "num":     10,
+                },
+                timeout=10,
             )
             if r.status_code != 200:
                 continue
+
             for result in r.json().get("organic_results") or []:
-                text = result.get("snippet", "") + " " + result.get("title", "")
-                found.extend(EMAIL_RE.findall(text))
-                found.extend(_find_obfuscated_emails(text))
+                # Extract emails from snippet + title text
+                text = (result.get("snippet") or "") + " " + (result.get("title") or "")
+                for em in EMAIL_RE.findall(text) + _find_obfuscated_emails(text):
+                    em = em.lower().strip()
+                    if em and em not in found_map and not _is_system_email(em):
+                        found_map[em] = {"address": em, "source": source_label, "query": query_text}
+
+                # Queue non-aggregator pages for deep scraping
                 link = result.get("link", "")
-                if link and not any(agg in link for agg in AGGREGATOR_DOMAINS) and len(scrape_urls) < 5:
+                if (link
+                        and not any(agg in link for agg in AGGREGATOR_DOMAINS)
+                        and link not in scrape_urls
+                        and len(scrape_urls) < 10):
                     scrape_urls.append(link)
+
         except Exception:
             continue
 
-    # Scrape the actual result pages for emails not visible in snippets
+    # Deep-scrape queued pages — often emails are buried in page source
     if scrape_urls:
         page_results = await asyncio.gather(
             *[_scrape_emails(client, u) for u in scrape_urls],
             return_exceptions=True,
         )
-        for pr in page_results:
+        for url, pr in zip(scrape_urls, page_results):
             if isinstance(pr, list):
-                found.extend(pr)
+                for em in _clean_emails(pr):
+                    em = em.lower().strip()
+                    if em and em not in found_map and not _is_system_email(em):
+                        found_map[em] = {"address": em, "source": "page scrape", "query": url}
 
-    return _clean_emails(found)
+    return list(found_map.values())
 
 
 async def _discover_emails_for_job(job: JobMatch) -> dict:
@@ -665,7 +708,7 @@ async def _discover_emails_for_job(job: JobMatch) -> dict:
     url      = job.job_url or ""
     location = job.location or ""
 
-    # LLM fallback: company name missing or is a known placeholder
+    # Enhanced company name lookup: scrape page → LLM → Google verify
     _bad = {
         "", "n/a", "na", "unknown", "various", "multiple", "confidential",
         "anonymous", "undisclosed", "not specified", "not disclosed",
@@ -675,7 +718,10 @@ async def _discover_emails_for_job(job: JobMatch) -> dict:
         "leading company", "top company", "mnc", "acca listed",
     }
     if company.lower() in _bad or len(company) < 2:
-        company = await _llm_extract_company(job.job_title or "", url) or company
+        from job_agent.tools.company_finder import find_company_name
+        found = await find_company_name(job.job_title or "", url)
+        if found:
+            company = found
 
     domain = _get_search_domain(url, company)
     domain_variants = _company_to_domain_variants(company) if company else []
@@ -717,9 +763,14 @@ async def _discover_emails_for_job(job: JobMatch) -> dict:
                 if isinstance(p, list):
                     _add(p, "contact page")
 
-        # 4. Google search (location-aware, scrapes result pages)
+        # 4. Google search — 8 targeted queries, returns rich {address, source, query} dicts
         if company:
-            _add(await _google_search_emails(client, company, domain, location), "Google search")
+            google_results = await _google_search_emails(client, company, domain, location)
+            for item in google_results:
+                addr = item["address"]
+                if addr not in seen and not _is_system_email(addr):
+                    seen.add(addr)
+                    found.append({"address": addr, "source": item["source"]})
 
         # 5. Hunter.io
         if domain:
@@ -730,7 +781,7 @@ async def _discover_emails_for_job(job: JobMatch) -> dict:
             slug = _re.sub(r"[^a-z0-9]", "-", company.lower()).strip("-")
             _add(await _scrape_emails(client, f"https://www.linkedin.com/company/{slug}/people/"), "LinkedIn")
 
-        # 7. HR email patterns
+        # 7. HR email patterns (fallback when live search finds nothing)
         for dv in domain_variants[:3]:
             _add(await _generate_hr_emails(dv), "pattern")
 
@@ -811,91 +862,302 @@ class BulkSendRequest(BaseModel):
     items: list[BulkSendItem]
 
 
+# In-memory store for bulk-send background tasks
+_bulk_send_tasks: dict[str, dict] = {}
+
+BULK_SEND_MAX_PER_DAY = 20
+BULK_SEND_GAP_SECONDS = 60
+
+
+async def _run_bulk_send_task(
+    task_id: str,
+    user_id: uuid.UUID,
+    items: list[BulkSendItem],
+    attachment_bytes: bytes | None,
+    attached_filename: str,
+):
+    """Background task: send emails one-by-one with BULK_SEND_GAP_SECONDS between each."""
+    results = []
+    _bulk_send_tasks[task_id]["status"] = "running"
+
+    async with AsyncSessionLocal() as db:
+        u = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+        if not u:
+            _bulk_send_tasks[task_id] = {"status": "error", "results": [], "error": "User not found"}
+            return
+
+        for idx, item in enumerate(items):
+            # 60-second cooldown between sends (skip before the first)
+            if idx > 0:
+                await asyncio.sleep(BULK_SEND_GAP_SECONDS)
+
+            try:
+                draft = (await db.execute(
+                    select(PendingEmail).where(
+                        PendingEmail.id == uuid.UUID(item.draft_id),
+                        PendingEmail.user_id == user_id,
+                        PendingEmail.status == "pending",
+                    )
+                )).scalar_one_or_none()
+
+                if not draft:
+                    results.append({"draft_id": item.draft_id, "success": False, "error": "Draft not found or already sent"})
+                    _bulk_send_tasks[task_id]["results"] = results
+                    continue
+
+                try:
+                    content = json.loads(draft.draft_content)
+                except Exception:
+                    content = {"subject": "Job Application", "body": draft.draft_content}
+
+                subject = content.get("subject", "Job Application")
+                body    = content.get("body", "")
+
+                gmail_thread_id = await _send_via_gmail(
+                    user=u, db=db,
+                    to=item.recipient_email,
+                    subject=subject, body=body,
+                    attachment_bytes=attachment_bytes,
+                    attachment_name=attached_filename or None,
+                )
+
+                db.add(SentEmail(
+                    id=uuid.uuid4(),
+                    user_id=user_id,
+                    job_id=draft.job_id,
+                    pending_id=draft.id,
+                    recipient_email=item.recipient_email,
+                    email_content=draft.draft_content,
+                    resume_attached=bool(attachment_bytes),
+                    gmail_thread_id=gmail_thread_id or None,
+                ))
+                await db.execute(
+                    update(PendingEmail)
+                    .where(PendingEmail.id == uuid.UUID(item.draft_id))
+                    .values(status="sent")
+                )
+                await db.commit()
+                results.append({"draft_id": item.draft_id, "success": True, "recipient": item.recipient_email})
+
+            except Exception as exc:
+                results.append({"draft_id": item.draft_id, "success": False, "error": str(exc)})
+
+            _bulk_send_tasks[task_id]["results"] = results
+
+    sent_count = sum(1 for r in results if r["success"])
+    _bulk_send_tasks[task_id] = {
+        "status": "done",
+        "results": results,
+        "sent": sent_count,
+        "total": len(results),
+    }
+
+
 @router.post("/bulk-send-emails")
 async def bulk_send_emails_json(
     req: BulkSendRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Send multiple drafted emails at once. Each item needs draft_id + recipient_email."""
+    """Queue bulk email send with rate limits: max 20/day, 60s gap, one per company per day.
+    Returns task_id immediately — poll /pipeline/bulk-send-status/{task_id} for progress."""
     fresh_user = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one_or_none()
     u = fresh_user or current_user
 
     if not u.gmail_refresh_token:
         raise HTTPException(status_code=400, detail="Gmail not connected. Connect Gmail in Settings to send emails.")
 
-    results = []
+    # ── Rate limit checks ──────────────────────────────────────────────────────
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    sent_today = (await db.execute(
+        select(SentEmail).where(
+            SentEmail.user_id == current_user.id,
+            SentEmail.sent_at >= today_start,
+        )
+    )).scalars().all()
+
+    already_sent_count = len(sent_today)
+    if already_sent_count >= BULK_SEND_MAX_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily limit reached: {BULK_SEND_MAX_PER_DAY} emails/day maximum. You've already sent {already_sent_count} today.",
+        )
+
+    # Companies already emailed today (one per company per day)
+    companies_sent_today: set[str] = set()
+    if sent_today:
+        job_ids_today = [s.job_id for s in sent_today if s.job_id]
+        if job_ids_today:
+            jobs_today = (await db.execute(
+                select(JobMatch).where(JobMatch.id.in_(job_ids_today))
+            )).scalars().all()
+            companies_sent_today = {(j.company or "").strip().lower() for j in jobs_today if j.company}
+
+    # Filter items: cap at daily remaining quota, skip already-emailed companies
+    remaining_quota = BULK_SEND_MAX_PER_DAY - already_sent_count
+    accepted: list[BulkSendItem] = []
+    skipped: list[dict] = []
+    session_companies: set[str] = set()  # dedup within this batch
+
     for item in req.items:
-        try:
-            draft = (await db.execute(
-                select(PendingEmail).where(
-                    PendingEmail.id == uuid.UUID(item.draft_id),
-                    PendingEmail.user_id == current_user.id,
-                    PendingEmail.status == "pending",
-                )
+        if len(accepted) >= remaining_quota:
+            skipped.append({"draft_id": item.draft_id, "reason": "daily limit reached"})
+            continue
+
+        # Look up company for this draft's job
+        draft = (await db.execute(
+            select(PendingEmail).where(
+                PendingEmail.id == uuid.UUID(item.draft_id),
+                PendingEmail.user_id == current_user.id,
+            )
+        )).scalar_one_or_none()
+
+        company_key = ""
+        if draft and draft.job_id:
+            job = (await db.execute(
+                select(JobMatch).where(JobMatch.id == draft.job_id)
             )).scalar_one_or_none()
-            if not draft:
-                results.append({"draft_id": item.draft_id, "success": False, "error": "Draft not found or already sent"})
-                continue
+            if job and job.company:
+                company_key = job.company.strip().lower()
 
-            try:
-                content = json.loads(draft.draft_content)
-            except Exception:
-                content = {"subject": "Job Application", "body": draft.draft_content}
+        if company_key and company_key in companies_sent_today:
+            skipped.append({"draft_id": item.draft_id, "reason": f"already emailed {company_key!r} today"})
+            continue
+        if company_key and company_key in session_companies:
+            skipped.append({"draft_id": item.draft_id, "reason": f"duplicate company {company_key!r} in this batch"})
+            continue
 
-            subject = content.get("subject", "Job Application")
-            body    = content.get("body", "")
+        if company_key:
+            session_companies.add(company_key)
+        accepted.append(item)
 
-            # Resolve resume
-            resume_path = u.resume_path or ""
-            resolved_resume = ""
-            if resume_path and os.path.exists(resume_path):
-                resolved_resume = resume_path
-            else:
-                for fname in os.listdir(RESUME_DIR):
-                    if fname.startswith(str(u.id)):
-                        resolved_resume = os.path.join(RESUME_DIR, fname)
-                        break
+    if not accepted:
+        return {
+            "task_id": None,
+            "queued": 0,
+            "skipped": skipped,
+            "message": "No emails queued — all were filtered by rate limits.",
+        }
 
-            attachment_bytes: bytes | None = None
-            attached_filename = ""
-            if resolved_resume:
-                try:
-                    with open(resolved_resume, "rb") as rf:
-                        attachment_bytes = rf.read()
-                    attached_filename = u.resume_original_name or os.path.basename(resolved_resume)
-                except Exception:
-                    pass
+    # ── Resolve resume once for all sends ─────────────────────────────────────
+    resume_path = u.resume_path or ""
+    resolved_resume = ""
+    if resume_path and os.path.exists(resume_path):
+        resolved_resume = resume_path
+    else:
+        for fname in os.listdir(RESUME_DIR):
+            if fname.startswith(str(u.id)):
+                resolved_resume = os.path.join(RESUME_DIR, fname)
+                break
 
-            sent_id = uuid.uuid4()
-            gmail_thread_id = await _send_via_gmail(
-                user=u, db=db, to=item.recipient_email,
-                subject=subject, body=body,
-                attachment_bytes=attachment_bytes,
-                attachment_name=attached_filename or None,
-            )
+    attachment_bytes: bytes | None = None
+    attached_filename = ""
+    if resolved_resume:
+        try:
+            with open(resolved_resume, "rb") as rf:
+                attachment_bytes = rf.read()
+            attached_filename = u.resume_original_name or os.path.basename(resolved_resume)
+        except Exception:
+            pass
 
-            db.add(SentEmail(
-                id=sent_id,
-                user_id=u.id,
-                job_id=draft.job_id,
-                pending_id=draft.id,
-                recipient_email=item.recipient_email,
-                email_content=draft.draft_content,
-                resume_attached=bool(attachment_bytes),
-                gmail_thread_id=gmail_thread_id or None,
-            ))
-            await db.execute(
-                update(PendingEmail)
-                .where(PendingEmail.id == uuid.UUID(item.draft_id))
-                .values(status="sent")
-            )
-            await db.commit()
-            results.append({"draft_id": item.draft_id, "success": True, "recipient": item.recipient_email})
+    # ── Fire background task ───────────────────────────────────────────────────
+    task_id = str(uuid.uuid4())
+    _bulk_send_tasks[task_id] = {"status": "queued", "results": [], "sent": 0, "total": len(accepted)}
 
-        except Exception as exc:
-            results.append({"draft_id": item.draft_id, "success": False, "error": str(exc)})
+    asyncio.create_task(_run_bulk_send_task(
+        task_id=task_id,
+        user_id=current_user.id,
+        items=accepted,
+        attachment_bytes=attachment_bytes,
+        attached_filename=attached_filename,
+    ))
 
-    sent_count = sum(1 for r in results if r["success"])
-    return {"results": results, "sent": sent_count, "total": len(results)}
+    eta_seconds = (len(accepted) - 1) * BULK_SEND_GAP_SECONDS
+    return {
+        "task_id": task_id,
+        "queued": len(accepted),
+        "skipped": skipped,
+        "eta_seconds": eta_seconds,
+        "message": f"Sending {len(accepted)} email(s) with {BULK_SEND_GAP_SECONDS}s gaps. ETA ~{eta_seconds}s.",
+    }
+
+
+@router.get("/bulk-send-status/{task_id}")
+async def bulk_send_status(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Poll the status of a bulk-send background task."""
+    task = _bulk_send_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+_BAD_COMPANY_SET = {
+    "", "n/a", "na", "unknown", "various", "multiple", "confidential",
+    "anonymous", "undisclosed", "not specified", "not disclosed",
+    "your organization", "your company", "your organisation",
+    "organization", "organisation", "company", "employer",
+    "hiring company", "hiring organization", "our client", "a client",
+    "leading company", "top company", "mnc", "acca listed",
+}
+
+
+@router.post("/fix-company-names")
+async def fix_company_names(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Backfill blank/bad company names using the 3-stage pipeline:
+      1. Scrape job page for structured hints (JSON-LD, meta, OG, title, domain)
+      2. LLM (Gemini Flash Lite) infers company name from hints
+      3. Google search verifies the name is real
+    Returns updated job list so the UI can refresh immediately.
+    """
+    from job_agent.tools.company_finder import find_company_name
+
+    jobs = (await db.execute(
+        select(JobMatch).where(JobMatch.user_id == current_user.id)
+    )).scalars().all()
+
+    needs_fix = [
+        j for j in jobs
+        if not j.company or j.company.strip().lower() in _BAD_COMPANY_SET or len(j.company.strip()) < 2
+    ]
+
+    if not needs_fix:
+        return {
+            "fixed": 0,
+            "total_checked": len(jobs),
+            "message": "All company names already look good.",
+            "updated": [],
+        }
+
+    sem = asyncio.Semaphore(3)  # max 3 concurrent page-scrapes
+
+    async def _fix_one(job: JobMatch) -> dict | None:
+        async with sem:
+            new_name = await find_company_name(job.job_title or "", job.job_url or "")
+            if new_name and new_name.strip().lower() not in _BAD_COMPANY_SET and len(new_name.strip()) >= 2:
+                clean = new_name.strip()
+                await db.execute(
+                    update(JobMatch).where(JobMatch.id == job.id).values(company=clean)
+                )
+                return {"job_id": str(job.id), "company": clean}
+            return None
+
+    results = await asyncio.gather(*[_fix_one(j) for j in needs_fix], return_exceptions=True)
+    await db.commit()
+
+    updated = [r for r in results if isinstance(r, dict)]
+
+    return {
+        "fixed": len(updated),
+        "total_checked": len(jobs),
+        "needed_fix": len(needs_fix),
+        "message": f"Fixed {len(updated)} of {len(needs_fix)} jobs with missing company names.",
+        "updated": updated,
+    }
 

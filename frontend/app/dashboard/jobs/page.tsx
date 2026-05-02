@@ -23,12 +23,22 @@ interface EmailState {
 }
 
 const SOURCE_LABELS: Record<string, string> = {
-  remoteok: 'RemoteOK', remotive: 'Remotive', weworkremotely: 'We Work Remotely',
-  arbeitnow: 'Arbeitnow', findwork: 'Findwork', jobicy: 'Jobicy',
-  themuse: 'The Muse', serpapi_google_jobs: 'Google Jobs', adzuna: 'Adzuna',
-  smartrecruiters: 'Brightspyre', bayt: 'Bayt.com', rozee: 'Rozee.pk',
-  acca_global: 'ACCA Global', trabajo_pk: 'Trabajo.org (PK)', bebee: 'Bebee',
-  joinimagine: 'Join Imagine', interviewpal: 'InterviewPal',
+  google_jobs:    'Google Jobs',
+  google_search:  'Google',
+  remoteok:       'RemoteOK',
+  remotive:       'Remotive',
+  weworkremotely: 'WWR',
+  arbeitnow:      'Arbeitnow',
+  findwork:       'Findwork',
+  jobicy:         'Jobicy',
+  themuse:        'The Muse',
+  bayt:           'Bayt',
+  rozee:          'Rozee.pk',
+  adzuna:         'Adzuna',
+  brightspyre:    'Brightspyre',
+  bebee:          'BeBee',
+  linkedin:       'LinkedIn',
+  indeed:         'Indeed',
 }
 
 export default function JobsPage() {
@@ -39,6 +49,10 @@ export default function JobsPage() {
   const [confirmClear, setConfirmClear]   = useState(false)
   const [clearError, setClearError]       = useState('')
   const [emailStates, setEmailStates]     = useState<Record<string, EmailState>>({})
+  const [fixingCompanies, setFixingCompanies] = useState(false)
+  const [fixCompanyMsg, setFixCompanyMsg]     = useState('')
+  const [page, setPage]                       = useState(1)
+  const PAGE_SIZE                             = 10
   const mountedRef                        = useRef(true)
 
   useEffect(() => {
@@ -129,6 +143,7 @@ export default function JobsPage() {
       const res     = await api.get('/dashboard/jobs')
       const fetched: Job[] = res.data
       setJobs(fetched)
+      setPage(1)
       const states = initStates(fetched)
       // Fire generation for all jobs that have no draft yet
       fetched.forEach(j => {
@@ -223,6 +238,23 @@ export default function JobsPage() {
     } finally { setClearing(false) }
   }
 
+  const fixCompanyNames = async () => {
+    setFixingCompanies(true); setFixCompanyMsg('')
+    try {
+      const res = await api.post('/pipeline/fix-company-names')
+      const d = res.data
+      setFixCompanyMsg(d.message || `Fixed ${d.fixed} company names.`)
+      // Patch updated companies in-place so UI refreshes instantly
+      if (d.updated?.length) {
+        const patchMap: Record<string, string> = {}
+        for (const u of d.updated) patchMap[u.job_id] = u.company
+        setJobs(prev => prev.map(j => patchMap[j.id] ? { ...j, company: patchMap[j.id] } : j))
+      }
+    } catch (err: any) {
+      setFixCompanyMsg(err.response?.data?.detail || 'Failed to fix company names.')
+    } finally { setFixingCompanies(false) }
+  }
+
   if (loading) return <div className="text-gray-400 py-12 text-center">Loading matched jobs…</div>
 
   return (
@@ -236,7 +268,11 @@ export default function JobsPage() {
           </p>
         </div>
         {jobs.length > 0 && (
-          <div className="flex items-center gap-2 flex-shrink-0">
+          <div className="flex items-center gap-2 flex-shrink-0 flex-wrap">
+            <button onClick={fixCompanyNames} disabled={fixingCompanies}
+              className="text-sm text-indigo-400 hover:text-indigo-300 border border-indigo-900 hover:border-indigo-700 disabled:opacity-50 px-3 py-1.5 rounded-lg transition">
+              {fixingCompanies ? 'Fixing…' : 'Fix Company Names'}
+            </button>
             {confirmClear ? (
               <>
                 <span className="text-gray-400 text-sm">Remove all {jobs.length} jobs?</span>
@@ -259,6 +295,11 @@ export default function JobsPage() {
         )}
       </div>
 
+      {fixCompanyMsg && (
+        <p className={`text-sm rounded-lg px-4 py-2 border ${fixCompanyMsg.startsWith('Failed') ? 'text-red-400 bg-red-950 border-red-900' : 'text-emerald-400 bg-emerald-950 border-emerald-900'}`}>
+          {fixCompanyMsg}
+        </p>
+      )}
       {clearError && (
         <p className="text-red-400 text-sm bg-red-950 border border-red-900 rounded-lg px-4 py-2">{clearError}</p>
       )}
@@ -270,7 +311,7 @@ export default function JobsPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {jobs.map(job => {
+          {jobs.slice(0, page * PAGE_SIZE).map(job => {
             const es = emailStates[job.id]
             if (!es) return null
             return (
@@ -293,7 +334,7 @@ export default function JobsPage() {
                         {job.status === 'applied' ? '✅ Applied' : job.status}
                       </span>
                     </div>
-                    <div className="text-gray-400 text-sm mt-1">{job.company} · {job.location}</div>
+                    <div className="text-gray-400 text-sm mt-1">{job.company || <span className="text-gray-600 italic">Unknown Company</span>} · {job.location}</div>
                     {(job.matched_skills?.length > 0 || job.missing_skills?.length > 0) && (
                       <div className="mt-2 space-y-1">
                         {job.matched_skills?.length > 0 && (
@@ -500,6 +541,31 @@ export default function JobsPage() {
               </div>
             )
           })}
+
+          {/* Pagination */}
+          <div className="flex items-center justify-between pt-2">
+            <p className="text-gray-600 text-sm">
+              Showing <span className="text-gray-400">{Math.min(page * PAGE_SIZE, jobs.length)}</span> of <span className="text-gray-400">{jobs.length}</span> jobs
+            </p>
+            <div className="flex items-center gap-2">
+              {page > 1 && (
+                <button
+                  onClick={() => setPage(p => p - 1)}
+                  className="text-sm text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 px-4 py-1.5 rounded-lg transition"
+                >
+                  ← Previous
+                </button>
+              )}
+              {page * PAGE_SIZE < jobs.length && (
+                <button
+                  onClick={() => setPage(p => p + 1)}
+                  className="text-sm text-blue-400 hover:text-white bg-blue-950 hover:bg-blue-900 border border-blue-800 px-4 py-1.5 rounded-lg transition"
+                >
+                  Load More ({jobs.length - page * PAGE_SIZE} remaining)
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

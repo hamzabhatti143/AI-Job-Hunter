@@ -29,7 +29,7 @@ from db.models import PendingEmail, JobMatch, ExtractedEmail
 
 from .tools.resume_parser import resume_parser_impl
 from .tools.skill_extractor import skill_extractor_impl
-from .tools.job_scraper import job_scraper_impl, _is_remote_input, _REMOTE_FILTER_TERMS
+from .tools.job_scraper import job_scraper_impl, _is_remote_input
 from .tools.job_matcher import job_matcher_impl
 from .tools.job_deduplication import job_deduplication_impl
 from .tools.job_expiry_checker import job_expiry_checker_impl
@@ -46,37 +46,6 @@ from .tools.task_manager import task_manager_impl
 from .tools.user_preference_tool import preference_get_impl
 
 
-# ── Location filter ───────────────────────────────────────────────────────────
-
-def _job_passes_location(job_loc: str, filter_terms: list[str], is_remote_search: bool) -> bool:
-    """
-    True if the job's location is acceptable for the user's search.
-
-    STRICT rules per spec:
-    - Empty/unknown location → always rejected.
-    - Remote search → ONLY remote-tagged jobs pass.
-    - Specific location search → remote jobs EXCLUDED (user wants onsite in that location).
-      Job location must contain at least one filter term.
-    """
-    loc_lower = job_loc.strip().lower()
-
-    # Empty location = unknown — reject strictly (never assume remote)
-    if not loc_lower:
-        return False
-
-    job_is_remote = any(rt in loc_lower for rt in _REMOTE_FILTER_TERMS)
-
-    if is_remote_search:
-        # Strict: only jobs that explicitly say "remote" / "worldwide" / etc.
-        return job_is_remote
-
-    # STRICT: for specific location searches, remote jobs are EXCLUDED.
-    # User typed a city/country — they want jobs there, not remote work.
-    if job_is_remote:
-        return False
-
-    return bool(filter_terms) and any(ft in loc_lower for ft in filter_terms)
-
 
 async def _scrape_and_filter(
     skills_json: str,
@@ -86,73 +55,33 @@ async def _scrape_and_filter(
     log_label: str = "primary",
 ) -> tuple[list[dict], dict]:
     """
-    Scrape jobs → resolve location via Nominatim → apply strict location filter.
-    Returns (filtered_jobs, loc_info).
-    loc_info is returned by the scraper after geocoding.
+    Search Google for '{role} jobs {location}' → return results.
+    Google already filters by location in the query, so no secondary filter needed.
     """
     raw = json.loads(await job_scraper_impl(
         skills_json=skills_json, location=location, role_preference=role,
     ))
     all_jobs: list[dict] = raw.get("jobs", [])
-    loc_info: dict       = raw.get("loc_info", {})
 
-    filter_terms     = loc_info.get("filter_terms", [])
-    is_remote_search = loc_info.get("is_remote", False)
-    geocoded         = loc_info.get("geocoded", False)
-
-    # Classify location type (A–E per spec)
-    is_remote_loc = loc_info.get("is_remote", False)
-    city          = loc_info.get("city", "")
-    country       = loc_info.get("country", "")
-    state         = loc_info.get("state", "")
-    is_region     = loc_info.get("is_region", False)
-    if is_remote_loc:
-        loc_type = "E"   # Remote / WFH / Anywhere / Worldwide
-    elif is_region:
-        loc_type = "D"   # Multi-country region (Gulf, Europe, etc.)
-    elif city and country and city.lower() != country.lower():
-        loc_type = "B"   # City + Country
-    elif city and not country:
-        loc_type = "A"   # City only
-    elif country and not city:
-        loc_type = "C"   # Country only
-    else:
-        loc_type = "D"   # State / Region fallback
+    is_remote_search = _is_remote_input(location)
+    loc_info = {
+        "is_remote":    is_remote_search,
+        "filter_terms": [],
+        "geocoded":     False,
+        "city":         "",
+        "country":      "",
+        "fallback_country": None,
+        "query":        raw.get("query", ""),
+    }
 
     await log("jobs_scraped", {
-        "count": len(all_jobs),
-        "attempt": log_label,
+        "count":    len(all_jobs),
+        "attempt":  log_label,
         "location": location,
-        "loc_type": loc_type,
-        "filter_terms": filter_terms[:6],
-        "geocoded": geocoded,
-        "city": city,
-        "country": country,
+        "query":    raw.get("query", ""),
     })
 
-    if not all_jobs:
-        return [], loc_info
-
-    kept      = []
-    discarded = 0
-    for job in all_jobs:
-        job_loc = job.get("location") or ""
-        if _job_passes_location(job_loc, filter_terms, is_remote_search):
-            kept.append(job)
-        else:
-            discarded += 1
-
-    if discarded:
-        await log("location_filter", {
-            "reason": "location_mismatch",
-            "attempt": log_label,
-            "discarded": discarded,
-            "kept": len(kept),
-            "filter_terms": filter_terms[:6],
-            "user_location": location,
-        })
-
-    return kept, loc_info
+    return all_jobs, loc_info
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -215,21 +144,26 @@ async def run_pipeline(
     except Exception:
         pass
 
-    # ── STEP 3 — Scrape + geocode + strict location filter ────────────────────
+    # ── STEP 3 — Scrape jobs ──────────────────────────────────────────────────
     filtered_jobs, loc_info = await _scrape_and_filter(
         skills_json, effective_location, effective_role, log, "primary"
     )
 
-    # Fallback 1: country-only (when city was entered but nothing found)
     fallback_used: str | None = None
-    if not filtered_jobs and loc_info.get("fallback_country"):
-        fallback_country = loc_info["fallback_country"]
-        await log("fallback_country", {"original": effective_location, "fallback": fallback_country})
-        filtered_jobs, _ = await _scrape_and_filter(
-            skills_json, fallback_country, effective_role, log, "fallback_country"
-        )
-        if filtered_jobs:
-            fallback_used = f"country ({fallback_country})"
+
+    # ── Location fallback: city → broader location ────────────────────────────
+    # If the city-level search returned nothing, try with just the country part
+    # (e.g. "Karachi, Pakistan" → "Pakistan") or strip the city for a wider net.
+    if not filtered_jobs:
+        loc_parts = [p.strip() for p in effective_location.split(",") if p.strip()]
+        fallback_loc = loc_parts[-1] if len(loc_parts) > 1 else None
+        if fallback_loc and fallback_loc.lower() != effective_location.lower():
+            await log("location_fallback", {"original": effective_location, "fallback": fallback_loc})
+            filtered_jobs, loc_info = await _scrape_and_filter(
+                skills_json, fallback_loc, effective_role, log, "fallback"
+            )
+            if filtered_jobs:
+                fallback_used = fallback_loc
 
     # ── Deduplication — remove cross-board duplicates ─────────────────────────
     if filtered_jobs:
@@ -244,16 +178,19 @@ async def run_pipeline(
         except Exception as e:
             await log("dedup_failed", {"error": str(e)})
 
-    # Per spec: NO remote fallback — never silently substitute remote jobs.
     if not filtered_jobs:
         await log("no_jobs_found", {"location": effective_location})
+        serp_key = os.getenv("SERPAPI_KEY") or os.getenv("SERP_API_KEY", "")
+        msg = (
+            f"No jobs found for '{effective_role}' in '{effective_location}'. "
+            "Try a different role title or broader location (e.g. 'Pakistan' instead of a city)."
+        )
+        if not serp_key:
+            msg = "SERPAPI_KEY is not set in backend/.env — job search requires it. " \
+                  "Get a free key at serpapi.com and add SERP_API_KEY=<your_key> to .env, then restart the backend."
         return {
             "success": True,
-            "output": (
-                f"No jobs found in '{effective_location}'. "
-                "Try a broader location like the country name, "
-                "or type 'Remote' if you are open to remote work."
-            ),
+            "output": msg,
             "matched_jobs": 0,
             "drafts": 0,
         }
@@ -269,6 +206,43 @@ async def run_pipeline(
     ))
     matched_jobs = step4.get("matched_jobs", [])
     await log("jobs_matched", {"total_matched": len(matched_jobs)})
+
+    # ── STEP 4b — LLM company name fill-in ───────────────────────────────────
+    # For any matched job with a blank/bad company name, use company_finder
+    # (page scrape → Gemini Flash Lite → Google verify) to fill it in now,
+    # before drafts are created and before the user sees the list.
+    _bad_companies = {
+        "", "n/a", "na", "unknown", "confidential", "anonymous",
+        "your organization", "your company", "hiring company", "our client",
+    }
+    needs_company = [
+        j for j in matched_jobs
+        if not j.get("company") or j.get("company", "").strip().lower() in _bad_companies
+    ]
+    if needs_company:
+        from job_agent.tools.company_finder import find_company_name
+        sem = asyncio.Semaphore(5)
+
+        async def _fill_company(job: dict) -> None:
+            async with sem:
+                name = await find_company_name(job.get("title", ""), job.get("url", ""))
+                if name and name.strip().lower() not in _bad_companies:
+                    job["company"] = name.strip()
+                    db_id = job.get("db_job_id")
+                    if db_id and user_id:
+                        try:
+                            async with AsyncSessionLocal() as s:
+                                async with s.begin():
+                                    await s.execute(
+                                        sa_update(JobMatch)
+                                        .where(JobMatch.id == uuid.UUID(db_id))
+                                        .values(company=name.strip())
+                                    )
+                        except Exception:
+                            pass
+
+        await asyncio.gather(*[_fill_company(j) for j in needs_company], return_exceptions=True)
+        await log("company_names_filled", {"filled": sum(1 for j in needs_company if j.get("company"))})
 
     if not matched_jobs:
         tip = (
@@ -360,13 +334,14 @@ async def run_pipeline(
                        "description": job.get("description", "")}
 
             # Application email + cover letter run concurrently
-            email_task  = email_writer_impl(
-                job_json=json.dumps(job_obj), skills_json=skills_json,
-                user_name=candidate_name, user_email=candidate_email,
-                api_key=api_key, recruiter_email=recruiter_email,
-                resume_text=resume_text,
+            email_task = email_writer_impl(
+                job_title=job_title,
+                company_name=company,
+                job_url=job.get("url", ""),
+                user_name=candidate_name,
+                user_email=candidate_email,
             )
-            cover_task  = cover_letter_impl(
+            cover_task = cover_letter_impl(
                 job_json=json.dumps(job_obj), skills_json=skills_json,
                 experience_years=experience_years, user_name=candidate_name,
                 api_key=api_key,
@@ -376,7 +351,7 @@ async def run_pipeline(
             step7 = json.loads(step7_raw) if not isinstance(step7_raw, Exception) else {}
             cover = json.loads(cover_raw) if not isinstance(cover_raw, Exception) else {}
 
-            if not step7.get("success"):
+            if step7.get("status") != "ready":
                 await log("draft_write_failed", {"job": job_title, "error": step7.get("error")})
                 continue
 
@@ -424,16 +399,10 @@ async def run_pipeline(
         summary += f" (location expanded to: {fallback_used})"
     summary += f". Drafted {draft_count} email(s) — check Application Drafts."
 
-    # Tip: suggest SerpAPI if not configured (without it, results lean remote-only)
-    google_jobs_tip = None
-    if not os.getenv("SERP_API_KEY", ""):
-        google_jobs_tip = "Tip: add SERP_API_KEY to .env for Google Jobs (LinkedIn/Indeed/Rozee.pk coverage)."
-
     return {
         "success": True,
         "output": summary,
         "matched_jobs": len(matched_jobs),
         "drafts": draft_count,
         "detected_role": step2.get("role", ""),
-        "google_jobs_tip": google_jobs_tip,
     }

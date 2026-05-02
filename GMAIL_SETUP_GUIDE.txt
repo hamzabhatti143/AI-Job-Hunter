@@ -1,0 +1,428 @@
+================================================================================
+                    GMAIL API EMAIL SETUP — COMPLETE GUIDE
+           How to implement Gmail-based email sending in any project
+================================================================================
+
+This guide covers everything needed to send emails via Gmail API using
+per-user OAuth 2.0 credentials. Each user sets up their own Google Cloud
+project and brings their own credentials — no shared API keys on the server.
+
+--------------------------------------------------------------------------------
+PART 1 — HOW IT WORKS (OVERVIEW)
+--------------------------------------------------------------------------------
+
+1. User creates a Google Cloud project and enables Gmail API
+2. User creates OAuth 2.0 credentials (Client ID + Client Secret)
+3. User enters those credentials in your app (or uploads credentials.json)
+4. App saves credentials to the database (per user)
+5. App redirects user to Google OAuth consent screen
+6. User grants Gmail permission
+7. Google returns an access token + refresh token
+8. App stores tokens in database
+9. App uses access token to send emails via Gmail API
+10. When access token expires (1 hour), app uses refresh token to get a new one
+
+--------------------------------------------------------------------------------
+PART 2 — GOOGLE CLOUD CONSOLE SETUP (USER DOES THIS)
+--------------------------------------------------------------------------------
+
+Step 1: Create a Google Cloud Project
+  - Go to https://console.cloud.google.com
+  - Click "Select a project" → "New Project"
+  - Name it anything (e.g. "MyApp Email")
+  - Click Create
+
+Step 2: Enable Gmail API
+  - Go to APIs & Services → Library
+  - Search for "Gmail API"
+  - Click it → click "Enable"
+
+Step 3: Configure OAuth Consent Screen
+  - Go to APIs & Services → OAuth consent screen
+  - Select "External" → Create
+  - Fill in:
+      App name: anything (e.g. MyApp)
+      User support email: your Gmail
+      Developer contact email: your Gmail
+  - Click Save and Continue
+  - On Scopes page, click "Add or Remove Scopes"
+  - Add these two scopes:
+      https://www.googleapis.com/auth/gmail.send
+      https://www.googleapis.com/auth/gmail.readonly   (only if you need reply tracking)
+  - Click Save and Continue
+  - On Test Users page, click "Add Users"
+  - Add your Gmail address as a test user
+  - Click Save and Continue → Back to Dashboard
+
+Step 4: Create OAuth Credentials
+  - Go to APIs & Services → Credentials
+  - Click "Create Credentials" → "OAuth client ID"
+  - Application type: Web application
+  - Name: anything
+  - Under "Authorized redirect URIs", click Add URI and enter:
+      https://your-backend-domain.com/auth/gmail/callback
+      (use http://localhost:8000/auth/gmail/callback for local development)
+  - Click Create
+  - Copy the Client ID and Client Secret shown in the dialog
+  - Or click "Download JSON" to get credentials.json
+
+--------------------------------------------------------------------------------
+PART 3 — DATABASE COLUMNS NEEDED
+--------------------------------------------------------------------------------
+
+Add these columns to your users table:
+
+    gmail_access_token    TEXT        -- current access token (expires in 1 hour)
+    gmail_refresh_token   TEXT        -- permanent refresh token
+    gmail_token_expiry    TIMESTAMPTZ -- when the access token expires
+    google_client_id      TEXT        -- user's own Google OAuth Client ID
+    google_client_secret  TEXT        -- user's own Google OAuth Client Secret
+    google_redirect_uri   TEXT        -- redirect URI registered in Google Cloud
+
+For reply tracking (optional), add to your sent_emails table:
+
+    gmail_thread_id       TEXT        -- thread ID returned by Gmail after sending
+    replied_at            TIMESTAMPTZ -- when recruiter replied (null = no reply)
+    reply_content         TEXT        -- text of the recruiter's reply
+
+SQL to add columns (PostgreSQL):
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_access_token TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_refresh_token TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS gmail_token_expiry TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS google_client_id TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS google_client_secret TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS google_redirect_uri TEXT;
+
+--------------------------------------------------------------------------------
+PART 4 — BACKEND IMPLEMENTATION (PYTHON / FASTAPI)
+--------------------------------------------------------------------------------
+
+--- 4A. SAVE USER CREDENTIALS ENDPOINT ---
+
+POST /auth/gmail/credentials
+Body: { google_client_id, google_client_secret, google_redirect_uri }
+
+    @router.post("/gmail/credentials")
+    async def save_gmail_credentials(req, current_user, db):
+        current_user.google_client_id     = req.google_client_id.strip()
+        current_user.google_client_secret = req.google_client_secret.strip()
+        current_user.google_redirect_uri  = req.google_redirect_uri.strip()
+        db.add(current_user)
+        await db.commit()
+        return {"success": True}
+
+
+--- 4B. START OAUTH FLOW ENDPOINT ---
+
+GET /auth/gmail/connect
+Returns a Google OAuth URL — frontend redirects user there.
+
+Scopes needed:
+    https://www.googleapis.com/auth/gmail.send
+    https://www.googleapis.com/auth/gmail.readonly   (for reply tracking)
+
+    GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+
+    state = secrets.token_urlsafe(16)
+    # Store state → (user_id, expires_at, client_id, client_secret, redirect_uri)
+    # in a short-lived in-memory dict (expires in 10 minutes)
+    _pending_oauth[state] = (user_id, time.monotonic() + 600, client_id, client_secret, redirect_uri)
+
+    url = GOOGLE_AUTH_URL + "?" + urlencode({
+        "client_id":     client_id,
+        "redirect_uri":  redirect_uri,
+        "response_type": "code",
+        "scope":         "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly",
+        "access_type":   "offline",   # IMPORTANT: needed to get refresh_token
+        "prompt":        "consent",   # IMPORTANT: forces refresh_token to be issued
+        "state":         state,
+    })
+    return {"url": url}
+
+
+--- 4C. OAUTH CALLBACK ENDPOINT ---
+
+GET /auth/gmail/callback
+Google calls this after user grants permission.
+
+    GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+    @router.get("/gmail/callback")
+    async def gmail_callback(code, state, error, db):
+        # Look up state → retrieve user_id, client_id, client_secret, redirect_uri
+        entry = _pending_oauth.pop(state, None)
+        user_id, expires_at, client_id, client_secret, redirect_uri = entry
+
+        # Exchange code for tokens
+        r = await httpx.post(GOOGLE_TOKEN_URL, data={
+            "code":          code,
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "redirect_uri":  redirect_uri,
+            "grant_type":    "authorization_code",
+        })
+        tokens = r.json()
+
+        # Save to database
+        user.gmail_access_token  = tokens["access_token"]
+        user.gmail_refresh_token = tokens["refresh_token"]  # only present on first auth
+        user.gmail_token_expiry  = datetime.now(utc) + timedelta(seconds=tokens["expires_in"])
+
+        # Redirect back to frontend
+        return RedirectResponse(f"{FRONTEND_URL}/settings?gmail=connected")
+
+
+--- 4D. TOKEN REFRESH HELPER ---
+
+Access tokens expire after 1 hour. Always call this before sending.
+
+    async def _get_valid_gmail_token(user, db) -> str:
+        now = datetime.now(timezone.utc)
+        needs_refresh = (
+            not user.gmail_access_token
+            or not user.gmail_token_expiry
+            or user.gmail_token_expiry <= now + timedelta(minutes=2)
+        )
+        if needs_refresh:
+            r = await httpx.post("https://oauth2.googleapis.com/token", data={
+                "client_id":     user.google_client_id,
+                "client_secret": user.google_client_secret,
+                "refresh_token": user.gmail_refresh_token,
+                "grant_type":    "refresh_token",
+            })
+            tokens = r.json()
+            user.gmail_access_token = tokens["access_token"]
+            user.gmail_token_expiry = now + timedelta(seconds=tokens.get("expires_in", 3600))
+            db.add(user)
+            await db.commit()
+        return user.gmail_access_token
+
+
+--- 4E. SEND EMAIL VIA GMAIL API ---
+
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    import base64, httpx
+
+    async def send_via_gmail(user, db, to, subject, body, attachment_bytes=None, attachment_name=None):
+        access_token = await _get_valid_gmail_token(user, db)
+
+        msg = MIMEMultipart()
+        msg["To"]      = to
+        msg["From"]    = user.email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        # Optional file attachment
+        if attachment_bytes and attachment_name:
+            from email.mime.base import MIMEBase
+            from email import encoders
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment_bytes)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=attachment_name)
+            msg.attach(part)
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+        r = await httpx.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"raw": raw},
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            raise ValueError(f"Gmail API error {r.status_code}: {r.text}")
+
+        # Returns threadId — save this if you want reply tracking
+        return r.json().get("threadId", "")
+
+
+--- 4F. CHECK FOR REPLIES (OPTIONAL) ---
+
+Poll Gmail threads to detect recruiter replies.
+Call this when the user opens their Sent Emails page.
+
+    async def check_replies(user, db):
+        # Get all sent emails that have a thread ID but no reply yet
+        sent_emails = db.query(SentEmail).filter(
+            SentEmail.user_id == user.id,
+            SentEmail.gmail_thread_id != None,
+            SentEmail.replied_at == None,
+        ).all()
+
+        access_token = await _get_valid_gmail_token(user, db)
+
+        for sent in sent_emails:
+            r = await httpx.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{sent.gmail_thread_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            messages = r.json().get("messages", [])
+            if len(messages) > 1:
+                # Thread has more than 1 message = recruiter replied
+                reply_text = extract_body(messages[1])
+                sent.replied_at    = datetime.now(utc)
+                sent.reply_content = reply_text[:5000]
+                db.add(sent)
+
+        db.commit()
+
+
+--- 4G. DISCONNECT GMAIL ENDPOINT ---
+
+    @router.delete("/gmail/disconnect")
+    async def disconnect(current_user, db):
+        current_user.gmail_access_token  = None
+        current_user.gmail_refresh_token = None
+        current_user.gmail_token_expiry  = None
+        db.add(current_user)
+        await db.commit()
+        return {"success": True}
+
+
+--- 4H. STATUS ENDPOINT ---
+
+    @router.get("/gmail/status")
+    async def gmail_status(current_user):
+        return {
+            "connected": bool(current_user.gmail_access_token and current_user.gmail_refresh_token)
+        }
+
+--------------------------------------------------------------------------------
+PART 5 — FRONTEND IMPLEMENTATION (REACT / NEXT.JS)
+--------------------------------------------------------------------------------
+
+--- 5A. CREDENTIALS FORM ---
+
+Show this form when Gmail is not connected:
+
+    <input placeholder="Client ID"     value={clientId}     onChange={...} />
+    <input placeholder="Client Secret" value={clientSecret} onChange={...} type="password" />
+    <input placeholder="Redirect URI"  value={redirectUri}  onChange={...} />
+
+    // File upload — auto-fills form from downloaded credentials.json
+    <input type="file" accept=".json" onChange={handleFile} />
+
+    const handleFile = (e) => {
+        const file = e.target.files[0]
+        const reader = new FileReader()
+        reader.onload = (ev) => {
+            const json = JSON.parse(ev.target.result)
+            const section = json.web || json.installed
+            setClientId(section.client_id)
+            setClientSecret(section.client_secret)
+            setRedirectUri(section.redirect_uris[0])
+        }
+        reader.readAsText(file)
+    }
+
+
+--- 5B. CONNECT FLOW ---
+
+    const connect = async () => {
+        // 1. Save credentials to backend
+        await api.post('/auth/gmail/credentials', {
+            google_client_id:     clientId,
+            google_client_secret: clientSecret,
+            google_redirect_uri:  redirectUri,
+        })
+
+        // 2. Get the Google OAuth URL
+        const res = await api.get('/auth/gmail/connect')
+
+        // 3. Redirect user to Google
+        window.location.href = res.data.url
+    }
+
+
+--- 5C. HANDLE CALLBACK RESULT ---
+
+After OAuth, Google redirects back to your backend callback, which then
+redirects to your frontend with a query param:
+    /settings?gmail=connected   ← success
+    /settings?gmail=error       ← failed
+    /settings?gmail=expired     ← state token timed out
+
+    const searchParams = useSearchParams()
+    useEffect(() => {
+        const result = searchParams.get('gmail')
+        if (result === 'connected') showSuccess('Gmail connected!')
+        if (result === 'error')     showError('Connection failed.')
+    }, [])
+
+--------------------------------------------------------------------------------
+PART 6 — ENVIRONMENT VARIABLES
+--------------------------------------------------------------------------------
+
+Backend .env — minimal, no Gmail keys needed server-side:
+    DATABASE_URL=...
+    SECRET_KEY=...
+    FRONTEND_URL=https://your-frontend.vercel.app   ← used in OAuth callback redirect
+
+Frontend .env.local (if using a proxy route):
+    BACKEND_URL=https://your-backend.com            ← optional override
+
+NOTE: GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET do NOT go in .env
+      They are stored per-user in the database.
+
+--------------------------------------------------------------------------------
+PART 7 — IMPORTANT GOTCHAS
+--------------------------------------------------------------------------------
+
+1. REDIRECT URI MUST MATCH EXACTLY
+   The URI in your form, in Google Cloud Console, and sent to the OAuth URL
+   must all be identical — same protocol, same domain, no trailing slash.
+   For production: https://your-backend.com/auth/gmail/callback
+   For local dev:  http://localhost:8000/auth/gmail/callback
+
+2. USE "access_type=offline" AND "prompt=consent"
+   Without these, Google will NOT return a refresh token.
+   Without a refresh token, tokens can't be renewed after 1 hour.
+
+3. ADD TEST USERS WHILE IN TESTING MODE
+   Google apps in "Testing" mode only work for emails added as test users.
+   Go to OAuth consent screen → Test users → Add your Gmail.
+   Without this, you get "Access blocked: app hasn't completed verification".
+
+4. FRONTEND URL ON BACKEND
+   Set FRONTEND_URL in your backend env vars to your real frontend domain.
+   This is used in the callback to redirect back after OAuth completes.
+   If left as localhost, the redirect after OAuth goes nowhere.
+
+5. NEXT.JS: WRAP useSearchParams IN SUSPENSE
+   If your callback result page uses useSearchParams(), wrap it:
+       export default function Page() {
+           return <Suspense fallback={<div>Loading...</div>}><Inner /></Suspense>
+       }
+       function Inner() {
+           const searchParams = useSearchParams()
+           ...
+       }
+
+6. REFRESH TOKEN IS ONLY RETURNED ONCE
+   Google only returns the refresh_token on the first authorization.
+   If the user reconnects, you may not get a new one unless you use prompt=consent.
+   Always use prompt=consent to force Google to return it every time.
+
+7. GMAIL API QUOTA
+   Free Gmail API: 1 billion quota units/day. Sending one email costs ~100 units.
+   In practice this limit is never hit for normal usage.
+
+--------------------------------------------------------------------------------
+PART 8 — PACKAGES NEEDED
+--------------------------------------------------------------------------------
+
+Backend (Python):
+    httpx          -- async HTTP client for calling Google APIs
+    python-jose    -- JWT tokens (or PyJWT)
+    sqlalchemy     -- ORM for storing tokens in database
+
+    pip install httpx python-multipart
+
+Frontend (Next.js):
+    No extra packages needed. Uses native FileReader and fetch/axios.
+
+--------------------------------------------------------------------------------
+END OF GUIDE
+================================================================================

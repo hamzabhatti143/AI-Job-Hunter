@@ -16,6 +16,7 @@ interface DraftState {
   subject: string
   body: string
   to: string
+  selectedEmails: string[]      // multi-select for bulk send
   saving: boolean
   sending: boolean
   sent: boolean
@@ -34,22 +35,38 @@ function parse(raw: string): Content {
 }
 
 const SOURCE_COLOR: Record<string, string> = {
-  'Google search': 'bg-blue-900 border-blue-700 text-blue-300',
-  'Hunter.io':     'bg-purple-900 border-purple-700 text-purple-300',
-  'careers page':  'bg-emerald-900 border-emerald-700 text-emerald-300',
-  'contact page':  'bg-teal-900 border-teal-700 text-teal-300',
-  'job listing':   'bg-gray-800 border-gray-600 text-gray-300',
-  'LinkedIn':      'bg-sky-900 border-sky-700 text-sky-300',
-  'pattern':       'bg-yellow-900 border-yellow-700 text-yellow-300',
+  'email prefix':    'bg-blue-900 border-blue-700 text-blue-300',
+  'recruiter search':'bg-blue-900 border-blue-700 text-blue-300',
+  'HR search':       'bg-indigo-900 border-indigo-700 text-indigo-300',
+  'hiring manager':  'bg-indigo-900 border-indigo-700 text-indigo-300',
+  'domain search':   'bg-emerald-900 border-emerald-700 text-emerald-300',
+  'application email':'bg-teal-900 border-teal-700 text-teal-300',
+  'LinkedIn':        'bg-sky-900 border-sky-700 text-sky-300',
+  'recent search':   'bg-blue-900 border-blue-700 text-blue-300',
+  'Google search':   'bg-blue-900 border-blue-700 text-blue-300',
+  'page scrape':     'bg-gray-800 border-gray-600 text-gray-300',
+  'Hunter.io':       'bg-purple-900 border-purple-700 text-purple-300',
+  'careers page':    'bg-emerald-900 border-emerald-700 text-emerald-300',
+  'contact page':    'bg-teal-900 border-teal-700 text-teal-300',
+  'job listing':     'bg-gray-800 border-gray-600 text-gray-300',
+  'pattern':         'bg-yellow-900 border-yellow-700 text-yellow-300',
 }
 const SOURCE_LABEL: Record<string, string> = {
-  'Google search': 'Google',
-  'Hunter.io':     'Hunter',
-  'careers page':  'Careers',
-  'contact page':  'Contact',
-  'job listing':   'Listing',
-  'LinkedIn':      'LinkedIn',
-  'pattern':       'Pattern',
+  'email prefix':    'Prefix',
+  'recruiter search':'Recruiter',
+  'HR search':       'HR',
+  'hiring manager':  'HiringMgr',
+  'domain search':   'Domain',
+  'application email':'Apply',
+  'LinkedIn':        'LinkedIn',
+  'recent search':   'Recent',
+  'Google search':   'Google',
+  'page scrape':     'Scraped',
+  'Hunter.io':       'Hunter',
+  'careers page':    'Careers',
+  'contact page':    'Contact',
+  'job listing':     'Listing',
+  'pattern':         'Pattern',
 }
 
 function SourceTag({ source }: { source: string }) {
@@ -71,7 +88,8 @@ export default function DraftsPage() {
 
   // Bulk-send state
   const [bulkSending, setBulkSending]   = useState(false)
-  const [bulkResult, setBulkResult]     = useState<{ sent: number; total: number } | null>(null)
+  const [bulkTaskId, setBulkTaskId]     = useState<string | null>(null)
+  const [bulkProgress, setBulkProgress] = useState<{ sent: number; total: number; done: boolean; skipped?: number; eta?: number } | null>(null)
 
   const setField = (id: string, patch: Partial<DraftState>) =>
     setStates(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }))
@@ -89,6 +107,7 @@ export default function DraftsPage() {
           saving: false, sending: false, sent: false, deleting: false,
           error: '', resumeWarning: '', copied: '',
           findingEmails: false, emailSuggestions: [], company: '', location: '',
+          selectedEmails: [],
         }
       }
       setStates(map)
@@ -165,6 +184,50 @@ export default function DraftsPage() {
     }
   }
 
+  // ── Send to multiple selected emails at once ─────────────────────────────
+  const sendDraftMulti = async (id: string, emails: string[]) => {
+    if (!emails.length) return
+    setField(id, { sending: true, error: '', resumeWarning: '' })
+    try {
+      // Save latest subject/body first
+      const s = states[id]
+      const putFd = new FormData()
+      putFd.append('subject', s.subject)
+      putFd.append('body',    s.body)
+      await api.put(`/pipeline/draft/${id}`, putFd)
+
+      // Queue as bulk send — each email gets its own send with 60s gap
+      const items = emails.map(email => ({ draft_id: id, recipient_email: email }))
+      const res = await api.post('/pipeline/bulk-send-emails', { items })
+      const { task_id, queued, skipped } = res.data
+
+      if (!task_id) {
+        setField(id, { sending: false, error: `All ${emails.length} emails were skipped (rate limit).` })
+        return
+      }
+
+      // Poll until done
+      const poll = setInterval(async () => {
+        try {
+          const status = await api.get(`/pipeline/bulk-send-status/${task_id}`)
+          const d = status.data
+          if (d.status === 'done' || d.status === 'error') {
+            clearInterval(poll)
+            const sentCount = (d.results as any[]).filter((r: any) => r.success).length
+            setField(id, {
+              sending: false,
+              sent: sentCount > 0,
+              resumeWarning: sentCount < emails.length ? `${sentCount}/${emails.length} sent (others rate-limited)` : '',
+            })
+            if (sentCount > 0) setTimeout(() => setDrafts(prev => prev.filter(dd => dd.id !== id)), 2000)
+          }
+        } catch { clearInterval(poll); setField(id, { sending: false }) }
+      }, 10_000)
+    } catch (err: any) {
+      setField(id, { sending: false, error: err.response?.data?.detail || 'Failed to send.' })
+    }
+  }
+
   // ── Individual send ────────────────────────────────────────────────────────
   const sendDraft = async (id: string) => {
     const s = states[id]
@@ -194,16 +257,45 @@ export default function DraftsPage() {
   const bulkSend = async () => {
     if (!readyDrafts.length) return
     setBulkSending(true)
-    setBulkResult(null)
+    setBulkTaskId(null)
+    setBulkProgress(null)
     try {
       const items = readyDrafts.map(d => ({ draft_id: d.id, recipient_email: states[d.id].to.trim() }))
       const res = await api.post('/pipeline/bulk-send-emails', { items })
-      setBulkResult({ sent: res.data.sent, total: res.data.total })
-      const sentIds = new Set((res.data.results as any[]).filter(r => r.success).map(r => r.draft_id))
-      setDrafts(prev => prev.filter(d => !sentIds.has(d.id)))
-    } catch {
-      setBulkResult({ sent: 0, total: readyDrafts.length })
-    } finally {
+      const { task_id, queued, skipped, eta_seconds } = res.data
+
+      if (!task_id) {
+        // All filtered — nothing to send
+        setBulkProgress({ sent: 0, total: 0, done: true, skipped: skipped?.length ?? 0 })
+        setBulkSending(false)
+        return
+      }
+
+      setBulkTaskId(task_id)
+      setBulkProgress({ sent: 0, total: queued, done: false, skipped: skipped?.length ?? 0, eta: eta_seconds })
+
+      // Poll every 15s until done
+      const poll = setInterval(async () => {
+        try {
+          const status = await api.get(`/pipeline/bulk-send-status/${task_id}`)
+          const d = status.data
+          const sentCount = (d.results as any[])?.filter((r: any) => r.success).length ?? 0
+          setBulkProgress(prev => ({ ...(prev ?? { total: queued, skipped: 0 }), sent: sentCount, done: d.status === 'done', eta: undefined }))
+
+          if (d.status === 'done' || d.status === 'error') {
+            clearInterval(poll)
+            setBulkSending(false)
+            const sentIds = new Set((d.results as any[]).filter((r: any) => r.success).map((r: any) => r.draft_id))
+            setDrafts(prev => prev.filter(dd => !sentIds.has(dd.id)))
+          }
+        } catch {
+          clearInterval(poll)
+          setBulkSending(false)
+        }
+      }, 15_000)
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || 'Failed to queue bulk send.'
+      setBulkProgress({ sent: 0, total: readyDrafts.length, done: true, skipped: 0 })
       setBulkSending(false)
     }
   }
@@ -275,17 +367,29 @@ export default function DraftsPage() {
               className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold px-4 py-2.5 rounded-xl transition flex items-center gap-2"
             >
               {bulkSending ? (
-                <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> Sending…</>
+                <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  {bulkProgress && !bulkProgress.done ? `Sending ${bulkProgress.sent}/${bulkProgress.total}…` : 'Queuing…'}
+                </>
               ) : `✉ Send All (${readyDrafts.length} ready)`}
             </button>
 
             {readyDrafts.length === 0 && !discovering && (
               <p className="text-gray-600 text-xs text-right">Discover emails first, then Send All</p>
             )}
-            {bulkResult && (
-              <p className={`text-xs font-medium ${bulkResult.sent === bulkResult.total ? 'text-emerald-400' : 'text-yellow-400'}`}>
-                {bulkResult.sent}/{bulkResult.total} sent successfully
-              </p>
+            {bulkProgress && (
+              <div className="text-xs text-right space-y-0.5">
+                {!bulkProgress.done ? (
+                  <p className="text-indigo-300 font-medium animate-pulse">
+                    Sending… {bulkProgress.sent}/{bulkProgress.total}
+                    {bulkProgress.eta ? ` · ~${Math.ceil(bulkProgress.eta / 60)}min remaining` : ''}
+                  </p>
+                ) : (
+                  <p className={`font-medium ${bulkProgress.sent === bulkProgress.total && bulkProgress.total > 0 ? 'text-emerald-400' : 'text-yellow-400'}`}>
+                    {bulkProgress.sent}/{bulkProgress.total} sent
+                    {bulkProgress.skipped ? ` · ${bulkProgress.skipped} skipped (rate limit)` : ''}
+                  </p>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -366,29 +470,84 @@ export default function DraftsPage() {
                           className="w-full bg-gray-950 border border-gray-700 focus:border-blue-500 text-white text-sm px-3 py-2 rounded-lg outline-none transition disabled:opacity-50"
                         />
 
-                        {/* Email suggestion chips */}
+                        {/* Email suggestion chips — multi-select */}
                         {s.emailSuggestions.length > 0 && (
-                          <div className="mt-2 space-y-1.5">
-                            <p className="text-gray-600 text-xs">
-                              {s.emailSuggestions.length} email{s.emailSuggestions.length > 1 ? 's' : ''} found — click to use:
-                            </p>
-                            <div className="flex flex-wrap gap-1.5">
-                              {s.emailSuggestions.map((sg, i) => (
+                          <div className="mt-3 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <p className="text-gray-400 text-xs font-medium">
+                                {s.emailSuggestions.length} email{s.emailSuggestions.length !== 1 ? 's' : ''} found
+                                {s.selectedEmails.length > 0 && (
+                                  <span className="ml-2 text-indigo-400">· {s.selectedEmails.length} selected</span>
+                                )}
+                              </p>
+                              <div className="flex gap-2">
                                 <button
-                                  key={i}
-                                  onClick={() => setField(draft.id, { to: sg.address })}
-                                  title={`Source: ${sg.source}`}
-                                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition ${
-                                    s.to === sg.address
-                                      ? 'bg-blue-600 border-blue-500 text-white'
-                                      : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-blue-500 hover:text-white'
-                                  }`}
-                                >
-                                  {sg.address}
-                                  <SourceTag source={sg.source} />
+                                  onClick={() => setField(draft.id, { selectedEmails: s.emailSuggestions.map(e => e.address) })}
+                                  className="text-[10px] text-indigo-400 hover:text-indigo-300 transition">
+                                  Select all
                                 </button>
-                              ))}
+                                <button
+                                  onClick={() => setField(draft.id, { selectedEmails: [], to: '' })}
+                                  className="text-[10px] text-gray-600 hover:text-gray-400 transition">
+                                  Clear
+                                </button>
+                              </div>
                             </div>
+
+                            <div className="flex flex-wrap gap-1.5">
+                              {s.emailSuggestions.map((sg, i) => {
+                                const isSelected = s.selectedEmails.includes(sg.address)
+                                const isFilled   = s.to === sg.address
+                                return (
+                                  <button
+                                    key={i}
+                                    title={`Source: ${sg.source} — click to fill To field, Ctrl+click to multi-select`}
+                                    onClick={(e) => {
+                                      if (e.ctrlKey || e.metaKey) {
+                                        // Ctrl+click → toggle multi-select
+                                        const next = isSelected
+                                          ? s.selectedEmails.filter(x => x !== sg.address)
+                                          : [...s.selectedEmails, sg.address]
+                                        setField(draft.id, { selectedEmails: next })
+                                      } else {
+                                        // Normal click → fill To field + select
+                                        const next = isSelected
+                                          ? s.selectedEmails.filter(x => x !== sg.address)
+                                          : [...s.selectedEmails, sg.address]
+                                        setField(draft.id, { to: sg.address, selectedEmails: next })
+                                      }
+                                    }}
+                                    className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition ${
+                                      isSelected
+                                        ? 'bg-indigo-700 border-indigo-500 text-white'
+                                        : isFilled
+                                          ? 'bg-blue-600 border-blue-500 text-white'
+                                          : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-indigo-500 hover:text-white'
+                                    }`}
+                                  >
+                                    {isSelected && <span className="text-indigo-300">✓</span>}
+                                    {sg.address}
+                                    <SourceTag source={sg.source} />
+                                  </button>
+                                )
+                              })}
+                            </div>
+
+                            {/* Multi-send bar — appears when 2+ emails selected */}
+                            {s.selectedEmails.length >= 2 && (
+                              <div className="flex items-center gap-2 mt-1 p-2 bg-indigo-950 border border-indigo-800 rounded-lg">
+                                <span className="text-indigo-300 text-xs flex-1">
+                                  Send to {s.selectedEmails.length} addresses: {s.selectedEmails.slice(0,2).join(', ')}{s.selectedEmails.length > 2 ? ` +${s.selectedEmails.length - 2} more` : ''}
+                                </span>
+                                <button
+                                  onClick={() => sendDraftMulti(draft.id, s.selectedEmails)}
+                                  disabled={s.sending}
+                                  className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg font-medium transition"
+                                >
+                                  {s.sending ? 'Sending…' : `Send to ${s.selectedEmails.length}`}
+                                </button>
+                              </div>
+                            )}
                           </div>
                         )}
 

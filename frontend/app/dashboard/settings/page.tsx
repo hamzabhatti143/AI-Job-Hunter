@@ -10,7 +10,7 @@ function SettingsInner() {
   const [email, setEmail] = useState('')
   const [name, setName] = useState('')
   const [gmailConnected, setGmailConnected] = useState(false)
-  const [creds, setCreds] = useState({ clientId: '', clientSecret: '', redirectUri: 'https://hamzabhatti-job-hunter.hf.space/auth/gmail/callback' })
+  const [creds, setCreds] = useState({ clientId: '', clientSecret: '', redirectUri: 'http://127.0.0.1:8000/auth/gmail/callback' })
   const [showSecret, setShowSecret] = useState(false)
   const [loading, setLoading] = useState(true)
   const [connecting, setConnecting] = useState(false)
@@ -203,7 +203,7 @@ function SettingsInner() {
                   type="text"
                   value={creds.redirectUri}
                   onChange={e => setCreds(p => ({ ...p, redirectUri: e.target.value }))}
-                  placeholder="https://hamzabhatti-job-hunter.hf.space/auth/gmail/callback"
+                  placeholder="http://127.0.0.1:8000/auth/gmail/callback"
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 text-sm"
                 />
                 <p className="text-xs text-gray-600 mt-1">Must exactly match the URI registered in Google Cloud Console.</p>

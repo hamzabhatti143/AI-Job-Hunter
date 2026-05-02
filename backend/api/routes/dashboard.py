@@ -91,8 +91,69 @@ async def clear_jobs(current_user: User = Depends(get_current_user), db: AsyncSe
 
 @router.get("/data/mail")
 async def get_mail_data(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(ExtractedEmail).where(ExtractedEmail.user_id == current_user.id))).scalars().all()
-    return [{"email": r.email, "source_url": r.source_url, "is_valid": r.is_valid, "job_id": str(r.job_id)} for r in rows]
+    """Return sent + pending emails enriched with job info for the Mail Data view."""
+    from sqlalchemy import outerjoin
+
+    # Sent emails (status = sent)
+    sent_rows = (await db.execute(
+        select(SentEmail).where(SentEmail.user_id == current_user.id).order_by(SentEmail.sent_at.desc())
+    )).scalars().all()
+
+    # Pending emails that still need sending
+    pending_rows = (await db.execute(
+        select(PendingEmail).where(
+            PendingEmail.user_id == current_user.id,
+            PendingEmail.status == "pending",
+        ).order_by(PendingEmail.created_at.desc())
+    )).scalars().all()
+
+    # Load all relevant job matches in one query
+    all_job_ids = list({r.job_id for r in sent_rows if r.job_id} | {r.job_id for r in pending_rows if r.job_id})
+    jobs_map: dict = {}
+    if all_job_ids:
+        job_rows = (await db.execute(
+            select(JobMatch).where(JobMatch.id.in_(all_job_ids))
+        )).scalars().all()
+        jobs_map = {str(j.id): j for j in job_rows}
+
+    result = []
+
+    for r in sent_rows:
+        job = jobs_map.get(str(r.job_id)) if r.job_id else None
+        # Parse email_content for source label
+        try:
+            ec = json.loads(r.email_content or "{}")
+        except Exception:
+            ec = {}
+        result.append({
+            "email":        r.recipient_email,
+            "company_name": job.company   if job else ec.get("company", ""),
+            "job_title":    job.job_title if job else ec.get("job_title", ""),
+            "location":     job.location  if job else "",
+            "source":       job.source    if job else "",
+            "status":       "sent",
+            "sent_at":      r.sent_at.isoformat(),
+            "replied_at":   r.replied_at.isoformat() if r.replied_at else None,
+        })
+
+    for r in pending_rows:
+        job = jobs_map.get(str(r.job_id)) if r.job_id else None
+        try:
+            ec = json.loads(r.draft_content or "{}")
+        except Exception:
+            ec = {}
+        result.append({
+            "email":        "",
+            "company_name": job.company   if job else ec.get("company", ""),
+            "job_title":    job.job_title if job else ec.get("job_title", ""),
+            "location":     job.location  if job else "",
+            "source":       job.source    if job else "",
+            "status":       "pending",
+            "sent_at":      None,
+            "replied_at":   None,
+        })
+
+    return result
 
 @router.get("/data/sent")
 async def get_sent_data(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
