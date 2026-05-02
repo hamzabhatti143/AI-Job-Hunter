@@ -131,9 +131,9 @@ export default function GuideContent() {
               <>Name it <span className="bg-gray-800 px-1.5 py-0.5 rounded font-mono text-xs text-gray-200">ApplyAI Backend</span></>,
               <>Under <span className="text-white font-medium">Authorized redirect URIs</span> click <span className="text-white font-medium">Add URI</span> and enter your backend callback URL:
                 <div className="mt-1 bg-gray-800 px-2 py-1 rounded font-mono text-xs text-green-400">
-                  https://your-backend-space.hf.space/auth/gmail/callback
+                  https://hamzabhatti-outreach-tool-82fb335.hf.space/auth/gmail/callback
                 </div>
-                <p className="text-gray-500 text-xs mt-1">Replace <span className="text-gray-300">your-backend-space</span> with your actual HF Space name. For local dev also add <span className="font-mono text-gray-300">http://localhost:8000/auth/gmail/callback</span></p>
+                <p className="text-gray-500 text-xs mt-1">Add this URI exactly as shown above.</p>
               </>,
               <>Click <span className="text-white font-medium">Create</span> — a dialog shows your <span className="text-white font-medium">Client ID</span> and <span className="text-white font-medium">Client Secret</span>. Copy both — keep them safe</>,
             ].map((s, i) => (

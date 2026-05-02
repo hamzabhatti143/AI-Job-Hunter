@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-// All requests go to /api/... which Next.js proxies to http://localhost:8000
+// All requests go to /api/... which Next.js proxies to https://hamzabhatti-outreach-tool-82fb335.hf.space
 // This avoids all CORS issues — requests are same-origin from the browser's perspective
 const api = axios.create({
   baseURL: '/api',
