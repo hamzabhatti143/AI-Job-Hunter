@@ -567,39 +567,114 @@ async def check_replies(
     return {"checked": len(rows), "new_replies": new_replies}
 
 
-@router.post("/find-emails/{job_id}")
-async def find_emails_for_job(
-    job_id: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Search Google + scrape company pages and return all found recruiter emails for a job."""
+async def _llm_extract_company(job_title: str, job_url: str) -> str:
+    """Ask Gemini to infer company name from job title + URL. Max 20 output tokens — very cheap."""
+    key = os.getenv("GEMINI_API_KEY", "")
+    if not key or (not job_title and not job_url):
+        return ""
+    prompt = f'Job title: "{job_title}"\nURL: "{job_url}"\nReply with only the company name, nothing else.'
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent",
+                params={"key": key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 20, "temperature": 0.0},
+                },
+            )
+            if r.status_code == 200:
+                name = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().strip('"').strip("'")
+                return name if 2 <= len(name) <= 60 else ""
+    except Exception:
+        pass
+    return ""
+
+
+async def _google_search_emails(
+    client: httpx.AsyncClient,
+    company: str,
+    domain: str,
+    location: str = "",
+) -> list[str]:
+    """Run 3 location-aware Google queries via SerpAPI, extract emails from snippets AND
+    scrape the top result pages directly for maximum coverage."""
+    from job_agent.tools.email_finder import (
+        EMAIL_RE, _find_obfuscated_emails, _clean_emails,
+        _scrape_emails, AGGREGATOR_DOMAINS,
+    )
+    key = os.getenv("SERP_API_KEY", "")
+    if not key:
+        return []
+
+    city = location.split(",")[0].strip() if location else ""
+    loc_q = f' "{city}"' if city else ""
+
+    queries = [
+        f'"{company}" recruiter OR "HR" email{loc_q}',
+        f'"{company}" jobs email contact{loc_q}',
+        f'site:{domain} email recruiter' if domain else f'"{company}" hiring email',
+    ]
+
+    found: list[str] = []
+    scrape_urls: list[str] = []
+
+    for q in queries:
+        try:
+            r = await client.get(
+                "https://serpapi.com/search.json",
+                params={"engine": "google", "q": q, "api_key": key, "num": 5},
+                timeout=8,
+            )
+            if r.status_code != 200:
+                continue
+            for result in r.json().get("organic_results") or []:
+                text = result.get("snippet", "") + " " + result.get("title", "")
+                found.extend(EMAIL_RE.findall(text))
+                found.extend(_find_obfuscated_emails(text))
+                link = result.get("link", "")
+                if link and not any(agg in link for agg in AGGREGATOR_DOMAINS) and len(scrape_urls) < 5:
+                    scrape_urls.append(link)
+        except Exception:
+            continue
+
+    # Scrape the actual result pages for emails not visible in snippets
+    if scrape_urls:
+        page_results = await asyncio.gather(
+            *[_scrape_emails(client, u) for u in scrape_urls],
+            return_exceptions=True,
+        )
+        for pr in page_results:
+            if isinstance(pr, list):
+                found.extend(pr)
+
+    return _clean_emails(found)
+
+
+async def _discover_emails_for_job(job: JobMatch) -> dict:
+    """Full email discovery pipeline for one job. Returns {company, location, emails}."""
+    import re as _re
     from job_agent.tools.email_finder import (
         _get_search_domain, _company_to_domain_variants, _scrape_emails,
-        _serpapi_email_search, _hunter_search, _generate_hr_emails,
-        _clean_emails, AGGREGATOR_DOMAINS, _extract_domain_from_url,
-        EMAIL_RE, _find_obfuscated_emails, _CAREER_PATHS, _CONTACT_PATHS,
-        _is_system_email, RFC5322_RE,
+        _hunter_search, _generate_hr_emails, _clean_emails,
+        AGGREGATOR_DOMAINS, _extract_domain_from_url,
+        _is_system_email, _CAREER_PATHS, _CONTACT_PATHS,
     )
-    import re
 
-    job = (await db.execute(
-        select(JobMatch).where(
-            JobMatch.id == uuid.UUID(job_id),
-            JobMatch.user_id == current_user.id,
-        )
-    )).scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    company  = (job.company or "").strip()
+    url      = job.job_url or ""
+    location = job.location or ""
 
-    company = job.company or ""
-    url = job.job_url or ""
+    # LLM fallback: company name missing or looks like a job board artifact
+    _bad = {"", "n/a", "unknown", "various", "multiple"}
+    if company.lower() in _bad or len(company) < 2:
+        company = await _llm_extract_company(job.job_title or "", url) or company
+
     domain = _get_search_domain(url, company)
     domain_variants = _company_to_domain_variants(company) if company else []
     if domain and domain not in domain_variants:
         domain_variants.insert(0, domain)
 
-    # Collect emails from all sources, labelled by source
     found: list[dict] = []
     seen: set[str] = set()
 
@@ -611,23 +686,33 @@ async def find_emails_for_job(
                 found.append({"address": e, "source": source})
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        # 1. Job listing page
+        # 1. Job listing page (only direct company URLs)
         if url and not any(agg in _extract_domain_from_url(url) for agg in AGGREGATOR_DOMAINS):
             _add(await _scrape_emails(client, url), "job listing")
 
         # 2. Careers pages
         if domain:
-            for path in _CAREER_PATHS[:4]:
-                _add(await _scrape_emails(client, f"https://{domain}{path}"), "careers page")
+            pages = await asyncio.gather(
+                *[_scrape_emails(client, f"https://{domain}{p}") for p in _CAREER_PATHS[:4]],
+                return_exceptions=True,
+            )
+            for p in pages:
+                if isinstance(p, list):
+                    _add(p, "careers page")
 
         # 3. Contact pages
         if domain:
-            for path in _CONTACT_PATHS[:4]:
-                _add(await _scrape_emails(client, f"https://{domain}{path}"), "contact page")
+            pages = await asyncio.gather(
+                *[_scrape_emails(client, f"https://{domain}{p}") for p in _CONTACT_PATHS[:3]],
+                return_exceptions=True,
+            )
+            for p in pages:
+                if isinstance(p, list):
+                    _add(p, "contact page")
 
-        # 4. SerpAPI Google search
+        # 4. Google search (location-aware, scrapes result pages)
         if company:
-            _add(await _serpapi_email_search(client, company, domain), "Google search")
+            _add(await _google_search_emails(client, company, domain, location), "Google search")
 
         # 5. Hunter.io
         if domain:
@@ -635,15 +720,78 @@ async def find_emails_for_job(
 
         # 6. LinkedIn
         if company:
-            company_slug = re.sub(r"[^a-z0-9]", "-", company.lower()).strip("-")
-            _add(await _scrape_emails(client, f"https://www.linkedin.com/company/{company_slug}/people/"), "LinkedIn")
+            slug = _re.sub(r"[^a-z0-9]", "-", company.lower()).strip("-")
+            _add(await _scrape_emails(client, f"https://www.linkedin.com/company/{slug}/people/"), "LinkedIn")
 
         # 7. HR email patterns
         for dv in domain_variants[:3]:
-            hr = await _generate_hr_emails(dv)
-            _add(hr, "pattern (hr@/jobs@/careers@)")
+            _add(await _generate_hr_emails(dv), "pattern")
 
-    return {"emails": found, "company": company}
+    return {"company": company, "location": location, "emails": found}
+
+
+@router.post("/find-emails/{job_id}")
+async def find_emails_for_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Discover recruiter emails for a single job — location-aware Google search + page scraping + LLM company fallback."""
+    job = (await db.execute(
+        select(JobMatch).where(
+            JobMatch.id == uuid.UUID(job_id),
+            JobMatch.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = await _discover_emails_for_job(job)
+    return result
+
+
+@router.post("/discover-all-emails")
+async def discover_all_emails(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Discover recruiter emails for ALL pending drafts at once — runs searches in parallel (max 3 concurrent)."""
+    drafts = (await db.execute(
+        select(PendingEmail).where(
+            PendingEmail.user_id == current_user.id,
+            PendingEmail.status == "pending",
+        )
+    )).scalars().all()
+
+    if not drafts:
+        return {"results": []}
+
+    # Fetch associated jobs
+    job_ids = [d.job_id for d in drafts if d.job_id]
+    jobs_rows = (await db.execute(
+        select(JobMatch).where(JobMatch.id.in_(job_ids))
+    )).scalars().all()
+    jobs_map = {str(j.id): j for j in jobs_rows}
+
+    sem = asyncio.Semaphore(3)  # max 3 concurrent Google searches
+
+    async def _bounded(draft: PendingEmail):
+        async with sem:
+            job = jobs_map.get(str(draft.job_id)) if draft.job_id else None
+            if not job:
+                return {"draft_id": str(draft.id), "company": "", "location": "", "emails": []}
+            result = await _discover_emails_for_job(job)
+            return {"draft_id": str(draft.id), **result}
+
+    results = await asyncio.gather(*[_bounded(d) for d in drafts], return_exceptions=True)
+    clean = []
+    for r in results:
+        if isinstance(r, Exception):
+            clean.append({"draft_id": "", "company": "", "location": "", "emails": [], "error": str(r)})
+        else:
+            clean.append(r)
+
+    return {"results": clean}
 
 
 from pydantic import BaseModel
