@@ -10,6 +10,7 @@ import uuid as uuid_module
 from agents import function_tool
 from db.database import AsyncSessionLocal
 from db.models import JobMatch
+from job_agent.tools.job_scraper import _clean_company
 
 STOP_WORDS = {'a','an','the','and','or','for','in','at','to','of','with','is','are','be','as','on','it','i'}
 
@@ -275,7 +276,7 @@ async def job_matcher_impl(
                             id=job_id,
                             user_id=uuid_module.UUID(user_id),
                             job_title=(job.get("title") or "")[:500],
-                            company=(job.get("company") or "")[:500],
+                            company=_clean_company(job.get("company") or "")[:500],
                             match_score=job["match_score"],
                             match_tier=job.get("match_tier"),
                             job_url=job.get("url", ""),

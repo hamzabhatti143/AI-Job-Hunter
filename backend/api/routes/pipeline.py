@@ -665,8 +665,15 @@ async def _discover_emails_for_job(job: JobMatch) -> dict:
     url      = job.job_url or ""
     location = job.location or ""
 
-    # LLM fallback: company name missing or looks like a job board artifact
-    _bad = {"", "n/a", "unknown", "various", "multiple"}
+    # LLM fallback: company name missing or is a known placeholder
+    _bad = {
+        "", "n/a", "na", "unknown", "various", "multiple", "confidential",
+        "anonymous", "undisclosed", "not specified", "not disclosed",
+        "your organization", "your company", "your organisation",
+        "organization", "organisation", "company", "employer",
+        "hiring company", "hiring organization", "our client", "a client",
+        "leading company", "top company", "mnc", "acca listed",
+    }
     if company.lower() in _bad or len(company) < 2:
         company = await _llm_extract_company(job.job_title or "", url) or company
 

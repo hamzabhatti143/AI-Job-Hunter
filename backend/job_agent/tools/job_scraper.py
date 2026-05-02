@@ -27,6 +27,30 @@ _REMOTE_TERMS = frozenset([
     "worldwide", "global", "distributed", "fully remote", "no office",
 ])
 
+# ── Company name cleaning ─────────────────────────────────────────────────────
+_BAD_COMPANY_NAMES = {
+    "", "n/a", "na", "unknown", "various", "multiple", "confidential",
+    "anonymous", "undisclosed", "not specified", "not disclosed",
+    "your organization", "your company", "your organisation",
+    "organization", "organisation", "company", "employer",
+    "hiring company", "hiring organization", "hiring organisation",
+    "client", "our client", "our company", "our organization",
+    "a client", "leading company", "top company", "global company",
+    "mnc", "mnc company", "acca listed",
+}
+
+def _clean_company(name: str) -> str:
+    """Return cleaned company name, or empty string if it's a known placeholder."""
+    if not name:
+        return ""
+    cleaned = name.strip()
+    if cleaned.lower() in _BAD_COMPANY_NAMES:
+        return ""
+    # Strip trailing punctuation/noise
+    cleaned = re.sub(r'\s*[|·•\-–—]\s*$', '', cleaned).strip()
+    return cleaned if len(cleaned) >= 2 else ""
+
+
 # Remote location terms — jobs matching these always pass the location filter
 _REMOTE_FILTER_TERMS = frozenset([
     "remote", "worldwide", "anywhere", "global", "wfh",
@@ -764,7 +788,7 @@ def _extract_jsonld_jobs(html: str, source: str, base_url: str = "") -> list[dic
 
                 # Company
                 org     = t.get("hiringOrganization") or {}
-                company = org.get("name", "") if isinstance(org, dict) else str(org)
+                company = _clean_company(org.get("name", "") if isinstance(org, dict) else str(org))
 
                 url = t.get("url") or t.get("identifier") or base_url
                 if not isinstance(url, str):
@@ -1067,7 +1091,7 @@ async def _fetch_acca_global(
                     if job_url not in seen and title:
                         seen.add(job_url)
                         jobs.append({
-                            "title": title, "company": "ACCA Listed",
+                            "title": title, "company": "",
                             "location": location or "", "url": job_url,
                             "description": "", "tags": ["finance", "accounting"], "source": "acca_global",
                         })
@@ -1082,7 +1106,7 @@ async def _fetch_acca_global(
                         if job_url not in seen:
                             seen.add(job_url)
                             jobs.append({
-                                "title": role, "company": "ACCA Listed",
+                                "title": role, "company": "",
                                 "location": location or "", "url": job_url,
                                 "description": "", "tags": ["finance"], "source": "acca_global",
                             })
@@ -1115,7 +1139,7 @@ async def _fetch_acca_global(
                         desc_raw = (desc_el.text or "") if desc_el is not None else ""
                         desc     = re.sub(r'<[^>]+>', ' ', desc_raw).strip()[:800]
                         jobs.append({
-                            "title": title, "company": "ACCA Listed",
+                            "title": title, "company": "",
                             "location": location or "", "url": url,
                             "description": desc, "tags": [], "source": "acca_global",
                         })
