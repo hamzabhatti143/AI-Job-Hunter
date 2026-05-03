@@ -90,6 +90,7 @@ export default function DraftsPage() {
   const [bulkSending, setBulkSending]   = useState(false)
   const [bulkTaskId, setBulkTaskId]     = useState<string | null>(null)
   const [bulkProgress, setBulkProgress] = useState<{ sent: number; total: number; done: boolean; skipped?: number; eta?: number } | null>(null)
+  const [bulkResult, setBulkResult]     = useState<{ sent: number; errors: number } | null>(null)
 
   const setField = (id: string, patch: Partial<DraftState>) =>
     setStates(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }))
